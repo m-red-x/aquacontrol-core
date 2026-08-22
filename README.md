@@ -122,7 +122,28 @@ format changed** and every deployed device speaking the old format is now incomp
 ## Using it from a firmware repo
 
 ```bash
-git submodule add https://github.com/m-red-x/aquacontrol-core.git components/aquacontrol-core
+git submodule add https://github.com/m-red-x/aquacontrol-core.git deps/aquacontrol-core
 ```
 
-ESP-IDF discovers `protocol/` and `core/` as components. Neither pulls in the other.
+Then name the two components explicitly in the firmware's root `CMakeLists.txt`, **before**
+including `project.cmake`:
+
+```cmake
+set(EXTRA_COMPONENT_DIRS
+    "${CMAKE_CURRENT_LIST_DIR}/deps/aquacontrol-core/protocol"
+    "${CMAKE_CURRENT_LIST_DIR}/deps/aquacontrol-core/core")
+```
+
+Two traps worth knowing, both of which cost a CI cycle to find:
+
+- **Mount it at `deps/`, not `components/`.** Anything directly under `components/` is
+  auto-scanned by ESP-IDF, and this repo's root is not a component — it *contains* two.
+- **Point at the component directories, not the repo root.** IDF treats any directory holding a
+  `CMakeLists.txt` as a single component rather than scanning it for children, and this repo's
+  root has one (the host build file). Pointing at the root shadows both real components.
+
+`protocol` and `core` are independent — neither pulls in the other. Declare whichever you need:
+
+```cmake
+idf_component_register(SRCS "main.c" REQUIRES protocol core)
+```
