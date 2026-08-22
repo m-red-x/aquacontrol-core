@@ -1,6 +1,13 @@
-# Host build. On the ESP32, protocol/ and core/ are added individually as
-# ESP-IDF components instead — see their own CMakeLists.txt for the dual-mode
-# pattern that makes the same sources build both ways.
+# Host build entry point ONLY.
+#
+# Under ESP-IDF this file must do nothing: the components live in protocol/ and
+# core/ and are discovered individually via EXTRA_COMPONENT_DIRS. If IDF ever
+# processes this file as a component it would hit project() and fail, so bail
+# out early rather than depending on where a firmware repo places the submodule.
+if(ESP_PLATFORM)
+  return()
+endif()
+
 cmake_minimum_required(VERSION 3.16)
 project(aquacontrol_core C)
 
