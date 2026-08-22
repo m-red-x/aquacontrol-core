@@ -7,14 +7,14 @@ static void test_state_round_trip(void) {
   uint8_t buf[AQUA_FRAME_MAX];
   int n;
 
-  in.outlet = AQUA_OUTLET_HEATER;
+  in.dev = 1u; /* device index, not a role — role lives in hub config */
   in.relay_on = true;
   in.watts_dw = 3000u; /* 300.0 W */
 
   n = aqua_encode_state(&in, buf, sizeof(buf));
   CHECK_EQ(n, 7);
   CHECK_EQ(aqua_decode_state(buf, (size_t)n, &out), AQUA_OK);
-  CHECK_EQ(out.outlet, in.outlet);
+  CHECK_EQ(out.dev, in.dev);
   CHECK_EQ(out.relay_on, in.relay_on);
   CHECK_EQ(out.watts_dw, in.watts_dw);
 }
@@ -27,7 +27,7 @@ static void test_state_wire_bytes_are_stable(void) {
   uint8_t buf[AQUA_FRAME_MAX];
   int n;
 
-  in.outlet = AQUA_OUTLET_HEATER; /* 1 */
+  in.dev = 1u; /* 1 */
   in.relay_on = true;
   in.watts_dw = 3000u; /* 0x0BB8, little-endian on the wire */
 
@@ -36,7 +36,7 @@ static void test_state_wire_bytes_are_stable(void) {
   CHECK_EQ(buf[0], AQUA_PROTO_MAJOR);
   CHECK_EQ(buf[1], AQUA_FRAME_STATE);
   CHECK_EQ(buf[2], 4);    /* payload length */
-  CHECK_EQ(buf[3], 1);    /* outlet */
+  CHECK_EQ(buf[3], 1);    /* dev */
   CHECK_EQ(buf[4], 1);    /* relay on */
   CHECK_EQ(buf[5], 0xB8); /* watts low byte */
   CHECK_EQ(buf[6], 0x0B); /* watts high byte */
@@ -50,7 +50,7 @@ static void test_event_round_trip(void) {
 
   in.seq = 0xDEADBEEFu;
   in.uptime_s = 86400u;
-  in.outlet = AQUA_OUTLET_HEATER;
+  in.dev = 1u; /* device index, not a role — role lives in hub config */
   in.kind = AQUA_EV_RELAY_WELD;
 
   n = aqua_encode_event(&in, buf, sizeof(buf));
@@ -58,7 +58,7 @@ static void test_event_round_trip(void) {
   CHECK_EQ(aqua_decode_event(buf, (size_t)n, &out), AQUA_OK);
   CHECK_EQ(out.seq, in.seq);
   CHECK_EQ(out.uptime_s, in.uptime_s);
-  CHECK_EQ(out.outlet, in.outlet);
+  CHECK_EQ(out.dev, in.dev);
   CHECK_EQ(out.kind, in.kind);
 }
 
@@ -70,12 +70,12 @@ static void test_cmd_and_ack_round_trip(void) {
   uint8_t buf[AQUA_FRAME_MAX];
   int n;
 
-  c_in.outlet = AQUA_OUTLET_PUMP;
+  c_in.dev = 2u;
   c_in.relay_on = false;
   n = aqua_encode_cmd(&c_in, buf, sizeof(buf));
   CHECK_EQ(n, 5);
   CHECK_EQ(aqua_decode_cmd(buf, (size_t)n, &c_out), AQUA_OK);
-  CHECK_EQ(c_out.outlet, c_in.outlet);
+  CHECK_EQ(c_out.dev, c_in.dev);
   CHECK_EQ(c_out.relay_on, c_in.relay_on);
 
   a_in.seq = 4242u;
@@ -91,7 +91,7 @@ static void test_sched_round_trip(void) {
   uint8_t buf[AQUA_FRAME_MAX];
   int n;
 
-  in.outlet = AQUA_OUTLET_LIGHT;
+  in.dev = 0u;
   in.on_minute = 480u;
   in.off_minute = 1080u;
   in.enabled = true;
@@ -99,7 +99,7 @@ static void test_sched_round_trip(void) {
   n = aqua_encode_sched(&in, buf, sizeof(buf));
   CHECK_EQ(n, 9);
   CHECK_EQ(aqua_decode_sched(buf, (size_t)n, &out), AQUA_OK);
-  CHECK_EQ(out.outlet, in.outlet);
+  CHECK_EQ(out.dev, in.dev);
   CHECK_EQ(out.on_minute, in.on_minute);
   CHECK_EQ(out.off_minute, in.off_minute);
   CHECK_EQ(out.enabled, in.enabled);
@@ -114,7 +114,7 @@ static void test_truncated_input_is_rejected(void) {
   int n;
   size_t i;
 
-  in.outlet = AQUA_OUTLET_LIGHT;
+  in.dev = 0u;
   in.relay_on = true;
   in.watts_dw = 100u;
   n = aqua_encode_state(&in, buf, sizeof(buf));
@@ -133,7 +133,7 @@ static void test_version_and_type_mismatch_rejected(void) {
   uint8_t buf[AQUA_FRAME_MAX];
   int n;
 
-  in.outlet = AQUA_OUTLET_LIGHT;
+  in.dev = 0u;
   in.relay_on = true;
   in.watts_dw = 100u;
   n = aqua_encode_state(&in, buf, sizeof(buf));
@@ -152,12 +152,12 @@ static void test_out_of_range_is_rejected(void) {
   aqua_sched_msg_t sched;
   uint8_t buf[AQUA_FRAME_MAX];
 
-  in.outlet = 9u; /* only 4 outlets exist */
+  in.dev = 99u; /* beyond AQUA_MAX_DEVICES */
   in.relay_on = true;
   in.watts_dw = 100u;
   CHECK_EQ(aqua_encode_state(&in, buf, sizeof(buf)), AQUA_ERR_RANGE);
 
-  sched.outlet = AQUA_OUTLET_LIGHT;
+  sched.dev = 0u;
   sched.on_minute = 2000u; /* > 1439 */
   sched.off_minute = 100u;
   sched.enabled = true;
@@ -168,7 +168,7 @@ static void test_encode_respects_buffer_capacity(void) {
   aqua_state_msg_t in;
   uint8_t small[4];
 
-  in.outlet = AQUA_OUTLET_LIGHT;
+  in.dev = 0u;
   in.relay_on = true;
   in.watts_dw = 100u;
   CHECK_EQ(aqua_encode_state(&in, small, sizeof(small)), AQUA_ERR_NOSPACE);
@@ -183,7 +183,7 @@ static void test_peek_reports_type_and_length(void) {
 
   in.seq = 1u;
   in.uptime_s = 2u;
-  in.outlet = AQUA_OUTLET_AUX;
+  in.dev = 3u;
   in.kind = AQUA_EV_MOTOR_RUN;
   n = aqua_encode_event(&in, buf, sizeof(buf));
 

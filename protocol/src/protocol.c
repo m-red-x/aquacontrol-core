@@ -84,14 +84,14 @@ int aqua_encode_state(const aqua_state_msg_t *m, uint8_t *out, size_t cap) {
   if (m == NULL || out == NULL) {
     return AQUA_ERR_RANGE;
   }
-  if (m->outlet >= AQUA_MAX_OUTLETS) {
+  if (m->dev >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
   h = write_header(out, cap, AQUA_FRAME_STATE, plen);
   if (h < 0) {
     return h;
   }
-  out[3] = m->outlet;
+  out[3] = m->dev;
   out[4] = m->relay_on ? 1u : 0u;
   put_u16(&out[5], m->watts_dw);
   return (int)(AQUA_FRAME_HEADER_LEN + plen);
@@ -103,7 +103,7 @@ int aqua_encode_event(const aqua_event_msg_t *m, uint8_t *out, size_t cap) {
   if (m == NULL || out == NULL) {
     return AQUA_ERR_RANGE;
   }
-  if (m->outlet >= AQUA_MAX_OUTLETS) {
+  if (m->dev >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
   h = write_header(out, cap, AQUA_FRAME_EVENT, plen);
@@ -112,7 +112,7 @@ int aqua_encode_event(const aqua_event_msg_t *m, uint8_t *out, size_t cap) {
   }
   put_u32(&out[3], m->seq);
   put_u32(&out[7], m->uptime_s);
-  out[11] = m->outlet;
+  out[11] = m->dev;
   out[12] = m->kind;
   return (int)(AQUA_FRAME_HEADER_LEN + plen);
 }
@@ -123,14 +123,14 @@ int aqua_encode_cmd(const aqua_cmd_msg_t *m, uint8_t *out, size_t cap) {
   if (m == NULL || out == NULL) {
     return AQUA_ERR_RANGE;
   }
-  if (m->outlet >= AQUA_MAX_OUTLETS) {
+  if (m->dev >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
   h = write_header(out, cap, AQUA_FRAME_CMD, plen);
   if (h < 0) {
     return h;
   }
-  out[3] = m->outlet;
+  out[3] = m->dev;
   out[4] = m->relay_on ? 1u : 0u;
   return (int)(AQUA_FRAME_HEADER_LEN + plen);
 }
@@ -141,7 +141,7 @@ int aqua_encode_sched(const aqua_sched_msg_t *m, uint8_t *out, size_t cap) {
   if (m == NULL || out == NULL) {
     return AQUA_ERR_RANGE;
   }
-  if (m->outlet >= AQUA_MAX_OUTLETS) {
+  if (m->dev >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
   if (m->on_minute > 1439u || m->off_minute > 1439u) {
@@ -151,7 +151,7 @@ int aqua_encode_sched(const aqua_sched_msg_t *m, uint8_t *out, size_t cap) {
   if (h < 0) {
     return h;
   }
-  out[3] = m->outlet;
+  out[3] = m->dev;
   put_u16(&out[4], m->on_minute);
   put_u16(&out[6], m->off_minute);
   out[8] = m->enabled ? 1u : 0u;
@@ -185,10 +185,10 @@ aqua_result_t aqua_decode_state(const uint8_t *buf, size_t len,
   if (r != AQUA_OK) {
     return r;
   }
-  if (p[0] >= AQUA_MAX_OUTLETS) {
+  if (p[0] >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
-  m->outlet = p[0];
+  m->dev = p[0];
   m->relay_on = (p[1] != 0u);
   m->watts_dw = get_u16(&p[2]);
   return AQUA_OK;
@@ -205,12 +205,12 @@ aqua_result_t aqua_decode_event(const uint8_t *buf, size_t len,
   if (r != AQUA_OK) {
     return r;
   }
-  if (p[8] >= AQUA_MAX_OUTLETS) {
+  if (p[8] >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
   m->seq = get_u32(&p[0]);
   m->uptime_s = get_u32(&p[4]);
-  m->outlet = p[8];
+  m->dev = p[8];
   m->kind = p[9];
   return AQUA_OK;
 }
@@ -225,10 +225,10 @@ aqua_result_t aqua_decode_cmd(const uint8_t *buf, size_t len, aqua_cmd_msg_t *m)
   if (r != AQUA_OK) {
     return r;
   }
-  if (p[0] >= AQUA_MAX_OUTLETS) {
+  if (p[0] >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
-  m->outlet = p[0];
+  m->dev = p[0];
   m->relay_on = (p[1] != 0u);
   return AQUA_OK;
 }
@@ -244,10 +244,10 @@ aqua_result_t aqua_decode_sched(const uint8_t *buf, size_t len,
   if (r != AQUA_OK) {
     return r;
   }
-  if (p[0] >= AQUA_MAX_OUTLETS) {
+  if (p[0] >= AQUA_MAX_DEVICES) {
     return AQUA_ERR_RANGE;
   }
-  m->outlet = p[0];
+  m->dev = p[0];
   m->on_minute = get_u16(&p[1]);
   m->off_minute = get_u16(&p[3]);
   m->enabled = (p[5] != 0u);

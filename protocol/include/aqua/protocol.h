@@ -19,17 +19,12 @@ extern "C" {
 #endif
 
 #define AQUA_PROTO_MAJOR 0u
-#define AQUA_MAX_OUTLETS 4u
+/* One plug = one socket (ADR-001), so this byte identifies the DEVICE, not a
+ * socket on a strip. 16 is a bounded cap that still catches garbage while
+ * covering the 5-10 plugs the original spec promised, with margin. */
+#define AQUA_MAX_DEVICES 16u
 #define AQUA_FRAME_HEADER_LEN 3u
 #define AQUA_FRAME_MAX 64u
-
-/* Outlet roles. Index is stable across the wire. */
-enum {
-  AQUA_OUTLET_LIGHT = 0,
-  AQUA_OUTLET_HEATER = 1,
-  AQUA_OUTLET_PUMP = 2,
-  AQUA_OUTLET_AUX = 3 /* was "feeder" — renamed per ADR-004 */
-};
 
 typedef enum {
   AQUA_FRAME_STATE = 1,
@@ -61,7 +56,7 @@ typedef enum {
  * That covers every aquarium load with resolution far finer than any sensor
  * we can afford. */
 typedef struct {
-  uint8_t outlet;
+  uint8_t dev;
   bool relay_on;
   uint16_t watts_dw;
 } aqua_state_msg_t;
@@ -69,17 +64,17 @@ typedef struct {
 typedef struct {
   uint32_t seq;
   uint32_t uptime_s;
-  uint8_t outlet;
+  uint8_t dev;
   uint8_t kind; /* aqua_event_kind_t */
 } aqua_event_msg_t;
 
 typedef struct {
-  uint8_t outlet;
+  uint8_t dev;
   bool relay_on;
 } aqua_cmd_msg_t;
 
 typedef struct {
-  uint8_t outlet;
+  uint8_t dev;
   uint16_t on_minute;  /* 0..1439 */
   uint16_t off_minute; /* 0..1439 */
   bool enabled;
