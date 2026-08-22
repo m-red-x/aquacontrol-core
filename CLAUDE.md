@@ -75,11 +75,35 @@ traps cost a CI cycle each.
 
 | Detector | Detects | Note |
 |---|---|---|
+| `aqua_temp_band_*` | **The tank itself** is too cold or too hot | **Needs no plug, no radio, no current sensing.** Works when the heater is unplugged, on an unmonitored socket, the plug is dead, or the link is down — every case the equipment detectors are blind to. **This alarm outranks the others; they exist to explain why it fired.** |
+| `aqua_probe_check()` | A DS18B20 reading that is not a temperature | +85.000 °C (power-on default) and −127.000 °C (bus error) are exact register values, not ranges. No detector acts on a reading it cannot trust. |
 | `aqua_heater_*` | Commanded ON, no draw, **and water falling** | Heater dead |
-| `aqua_overheat_*` | Commanded ON, draw **continuous**, water above target and climbing | **The failure that cooks a tank.** The only detector with a real control response — opening the relay actually saves it |
+| `aqua_overheat_*` | Commanded ON, draw **continuous**, water above target **and still rising** | **The failure that cooks a tank.** The only detector with a real control response — opening the relay actually saves it. The climbing requirement is real, not decorative: a tank steady over target is at equilibrium, not running away. |
 | `aqua_weld_*` | Commanded OFF, current still flowing | Welded contact in *our plug*. Largely benign alone: the heater's own thermostat still regulates |
 | `aqua_pump_*` | Outlet drawing no power | **Not** "circulation verified" — a jammed impeller often draws *more* |
 | `aqua_o2_capacity_ugl()` | Saturation ceiling from temperature | **Not a measurement.** See below |
+
+## The two invariants that are easy to break
+
+**1. `AQUA_VERDICT_UNKNOWN = 0`.** Zeroed memory must read as *no evidence*, never as *fine*. A
+freshly-initialised detector reports UNKNOWN, and so does one that cannot judge. ADR-014: absence of
+evidence must never render as an all-clear.
+
+**2. Every detector checks `sample_continuous()` before extending a window.** This one has bitten
+already and would have cut a heater in winter.
+
+A detector only sees the samples it is handed. Two samples three hours apart are *not* three hours of
+observed evidence — but that is exactly what an ESP-NOW dropout produces, and `aqua_overheat_*` FAULT
+**opens the heater relay** and latches. So a sample arriving later than `cfg->max_gap_ms`, **or with
+the clock stepped backwards** (DST; the hub has a DS3231 and no NTP; a battery device reboots with
+`now_ms` at zero), restarts the window and reports UNKNOWN.
+
+⚠️ **Latch checks run BEFORE the continuity check** — a fault already confirmed must survive a
+dropout. Losing contact is not a reason to forget something established.
+
+⚠️ If you add a detector, it needs `last_update_ms` + `has_last` in its state and `max_gap_ms` in its
+cfg, sized against **its own** confirm window. A 5-second confirm window with a 5-minute gap
+tolerance would "confirm" from two samples nobody observed.
 
 ⚠️ **`relay ON but 0 W = fault` is naively wrong.** A thermostatted aquarium heater legitimately
 draws 0 W whenever satisfied — which, on a stable tank, is most of every hour. Zero draw is the
@@ -106,7 +130,26 @@ changed** and deployed devices are now incompatible — bump `AQUA_PROTO_MAJOR` 
 than "fixing" the test.
 
 Transport is ESP-NOW, but the codec must stay transport-agnostic so BLE can be added for the phone
-app later without touching `core/`.
+app later without touching `core/`. (ESP-NOW and BLE coexist on the ESP32-S3's single radio via
+software coexistence — verified, so ADR-003 does not foreclose the app phase.)
+
+**`dev` is a device index, not a socket index.** Under ADR-001 one plug = one socket, so the byte
+identifies *which plug*. `AQUA_MAX_DEVICES` is 16. There is deliberately **no role on the wire** —
+the old `AQUA_OUTLET_LIGHT/HEATER/PUMP/AUX` enum was a fossil of the four-socket strip design, and it
+made `dev == AQUA_OUTLET_HEATER` a line someone would write. Since `aqua_overheat_*` answers FAULT by
+opening a relay, a misrouted role cuts power to the wrong socket. **Role lives in hub-side config,
+assigned at pairing.**
+
+⚠️ **`aqua_peek()` compares `proto_major` for EXACT equality in both directions.** There is no
+forward compatibility, no TLVs, and no version negotiation — an older *or* newer peer is rejected
+outright, not degraded. While major is 0 that is fine: flash both ends together. It becomes a real
+constraint after ADR-013, because customers flash their own plugs and there is no fleet update path.
+
+**The stop-list.** These have all been proposed and all declined until real S0 data exists. Do not
+add them because they are "only two bytes": no `src` field (the `dev` byte already is the device id,
+and ESP-NOW hands you the sender MAC free in `esp_now_recv_info_t`), no site id, no `cmd_id`, no
+TLVs, no BEACON/HELLO/PING frames, no flags byte, no version nibbles, no `testdata/vN` corpus, no CRC
+(ESP-NOW has one at the MAC layer).
 
 ## Conventions
 
