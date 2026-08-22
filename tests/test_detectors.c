@@ -154,7 +154,9 @@ static void test_healthy_heater_never_alarms_over_a_full_day(void) {
   aqua_heater_t h;
   aqua_heater_cfg_t cfg = aqua_heater_default_cfg();
   uint64_t t;
-  int worst = AQUA_VERDICT_OK;
+  int worst = AQUA_VERDICT_UNKNOWN; /* NOT OK: UNKNOWN is 0, so seeding at OK
+                                    * would hide a regression that made every
+                                    * sample UNKNOWN. */
 
   aqua_heater_init(&h);
 
@@ -240,19 +242,19 @@ static void test_weld_detected_and_latches(void) {
   v = aqua_weld_update(&w, &cfg, 0u, false, 3000u);
   CHECK_EQ(v, AQUA_VERDICT_SUSPECT);
 
-  v = aqua_weld_update(&w, &cfg, 3000u, false, 3000u);
-  CHECK_EQ(v, AQUA_VERDICT_SUSPECT); /* inside the 5 s confirm window */
+  v = aqua_weld_update(&w, &cfg, 10000u, false, 3000u);
+  CHECK_EQ(v, AQUA_VERDICT_SUSPECT); /* inside the 15 s confirm window */
 
-  v = aqua_weld_update(&w, &cfg, 6000u, false, 3000u);
+  v = aqua_weld_update(&w, &cfg, 20000u, false, 3000u);
   CHECK_EQ(v, AQUA_VERDICT_FAULT);
 
   /* Latched: even if the reading drops away, the alarm stands until the
    * hardware is actually replaced and the detector re-initialised. */
-  v = aqua_weld_update(&w, &cfg, 9000u, false, 0u);
+  v = aqua_weld_update(&w, &cfg, 25000u, false, 0u);
   CHECK_EQ(v, AQUA_VERDICT_FAULT);
 
   aqua_weld_init(&w);
-  v = aqua_weld_update(&w, &cfg, 10000u, false, 0u);
+  v = aqua_weld_update(&w, &cfg, 30000u, false, 0u);
   CHECK_EQ(v, AQUA_VERDICT_OK);
 }
 
@@ -276,6 +278,11 @@ static void test_weld_ignores_switching_transient(void) {
   aqua_weld_init(&w);
   CHECK_EQ(aqua_weld_update(&w, &cfg, 0u, false, 3000u), AQUA_VERDICT_SUSPECT);
   CHECK_EQ(aqua_weld_update(&w, &cfg, 1000u, false, 0u), AQUA_VERDICT_OK);
+  /* And a reading that persists across the meter settle tail but clears before
+   * the confirm window must NOT latch - this is the scheduled light-off case
+   * that a 5 s window would have turned into a permanent false alarm. */
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 2000u, false, 3000u), AQUA_VERDICT_SUSPECT);
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 11000u, false, 0u), AQUA_VERDICT_OK);
 }
 
 /* ------------------------------------------- heater thermostat stuck ------ */
@@ -313,7 +320,9 @@ static void test_cycling_heater_never_trips_overheat(void) {
   aqua_overheat_t o;
   aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
   uint64_t t;
-  int worst = AQUA_VERDICT_OK;
+  int worst = AQUA_VERDICT_UNKNOWN; /* NOT OK: UNKNOWN is 0, so seeding at OK
+                                    * would hide a regression that made every
+                                    * sample UNKNOWN. */
 
   aqua_overheat_init(&o);
 
@@ -359,14 +368,14 @@ static void test_weld_and_overheat_are_distinct(void) {
   /* Commanded OFF, current flowing = welded plug relay. Needs two samples:
    * one to start the confirm window, one past it. */
   CHECK_EQ(aqua_weld_update(&w, &wc, 0u, false, 3000u), AQUA_VERDICT_SUSPECT);
-  CHECK_EQ(aqua_weld_update(&w, &wc, 6000u, false, 3000u), AQUA_VERDICT_FAULT);
+  CHECK_EQ(aqua_weld_update(&w, &wc, 20000u, false, 3000u), AQUA_VERDICT_FAULT);
 
   /* Same input, overheat detector: must stay quiet. A welded plug relay is
    * not the tank-cooking failure, and treating it as one would be the very
    * conflation this test exists to prevent. */
   CHECK_EQ(aqua_overheat_update(&o, &oc, 0u, false, 3000u, 25000, 25000),
            AQUA_VERDICT_OK);
-  CHECK_EQ(aqua_overheat_update(&o, &oc, 6000u, false, 3000u, 25000, 25000),
+  CHECK_EQ(aqua_overheat_update(&o, &oc, 20000u, false, 3000u, 25000, 25000),
            AQUA_VERDICT_OK);
 
   /* Commanded ON with normal current = healthy. The weld detector must stay
@@ -428,7 +437,7 @@ static void test_latched_fault_survives_a_dropout(void) {
 
   aqua_weld_init(&w);
   CHECK_EQ(aqua_weld_update(&w, &cfg, 0u, false, 3000u), AQUA_VERDICT_SUSPECT);
-  CHECK_EQ(aqua_weld_update(&w, &cfg, 6000u, false, 3000u), AQUA_VERDICT_FAULT);
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 20000u, false, 3000u), AQUA_VERDICT_FAULT);
   /* Three hours of silence. The alarm stands. */
   CHECK_EQ(aqua_weld_update(&w, &cfg, 3u * 60u * MIN_MS, false, 3000u),
            AQUA_VERDICT_FAULT);
@@ -476,6 +485,10 @@ static void test_forward_clock_jump_does_not_confirm(void) {
   /* now_ms leaps a day when the RTC is read. */
   v = aqua_overheat_update(&o, &cfg, 24u * 60u * MIN_MS, true, 250u, 26500, 25000);
   CHECK(v != AQUA_VERDICT_FAULT);
+  /* Pin the REASON, not just the outcome. Without this the test passes even if
+   * sample_continuous() is deleted outright, because the "climbing" rule added
+   * later happens to return SUSPECT for this input anyway. */
+  CHECK_EQ(v, AQUA_VERDICT_UNKNOWN);
 }
 
 /* Normal sampling must not be disturbed by any of this. */
@@ -483,7 +496,9 @@ static void test_regular_sampling_is_unaffected(void) {
   aqua_temp_band_t b;
   aqua_temp_band_cfg_t cfg = aqua_temp_band_default_cfg();
   uint64_t t;
-  int worst = AQUA_VERDICT_OK;
+  int worst = AQUA_VERDICT_UNKNOWN; /* NOT OK: UNKNOWN is 0, so seeding at OK
+                                    * would hide a regression that made every
+                                    * sample UNKNOWN. */
 
   aqua_temp_band_init(&b);
   for (t = 0; t < 24u * 60u * MIN_MS; t += MIN_MS) {

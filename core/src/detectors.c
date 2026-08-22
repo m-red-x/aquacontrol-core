@@ -233,11 +233,18 @@ void aqua_weld_init(aqua_weld_t *w) {
 
 aqua_weld_cfg_t aqua_weld_default_cfg(void) {
   aqua_weld_cfg_t c;
-  c.confirm_ms = 5u * 1000u;  /* 5 s rules out switching transients */
+  /* 15 s, NOT 5 s. The HLW8032 takes ~8 s to settle after a load change, so a
+   * 5 s window would confirm a weld from the meter's own settling tail every
+   * time the photoperiod switches the light off - and weld FAULT LATCHES and
+   * tells the owner to unplug it at the wall. A permanent false alarm on day
+   * one. The plug firmware should ALSO blank readings across a relay
+   * transition; this is belt and braces because that blanking does not exist
+   * yet. Replace with the real settle time once S0 measures it. */
+  c.confirm_ms = 15u * 1000u;
   c.draw_threshold_dw = 50u;  /* 5.0 W */
-  /* Confirm window is only 5 s, so gap tolerance must be tight - otherwise
-   * two distant samples would 'confirm' a weld nobody observed. */
-  c.max_gap_ms = 15u * 1000u;
+  /* Kept proportional to the confirm window: two distant samples must not
+   * 'confirm' a weld nobody observed. */
+  c.max_gap_ms = 30u * 1000u;
   return c;
 }
 
@@ -343,6 +350,18 @@ aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
     return o->verdict;
   }
 
+  /* The SETPOINT is the only other temperature feeding this decision, and it
+   * was unguarded. A corrupt or never-written NVS value reading back as
+   * 0xFFFFFFFF gives target = -1, making too_hot true at any normal tank
+   * temperature - and FAULT here OPENS THE HEATER RELAY. The header's warning
+   * about believing a bad probe applies word for word to believing a bad
+   * setpoint. Also stops an unguarded int32 addition from overflowing. */
+  if (target_temp_mc < AQUA_PROBE_MIN_MC || target_temp_mc > AQUA_PROBE_MAX_MC) {
+    o->continuous_draw = false;
+    o->verdict = AQUA_VERDICT_SUSPECT;
+    return o->verdict;
+  }
+
   /* NEVER act on an untrustworthy probe. A DS18B20 stuck at its +85 C power-on
    * default would make too_hot permanently true — and this is the one detector
    * whose FAULT is meant to open the heater relay. Believing a bad probe here
@@ -408,7 +427,18 @@ void aqua_pump_init(aqua_pump_t *p) {
 aqua_pump_cfg_t aqua_pump_default_cfg(void) {
   aqua_pump_cfg_t c;
   c.confirm_ms = 60u * 1000u; /* 60 s — rules out a brief brownout */
-  c.draw_threshold_dw = 20u;  /* 2.0 W; small nano pumps are only a few watts */
+  /* 5.0 W, NOT 2.0 W. The HLW8032 ZEROES OUT below roughly 2 W, so a threshold
+   * at 2 W sits exactly on the noise floor: a healthy 1.5 W nano pump reports a
+   * literal 0 and would latch FAULT on a pump running perfectly.
+   *
+   * The corollary is a PRODUCT limit, not a tuning value. A pump drawing less
+   * than about 5 W cannot be monitored on this meter at all, because a stopped
+   * pump and a running sub-floor pump both report zero and are
+   * indistinguishable. If S0 shows your pump does not clear the floor, DISABLE
+   * monitoring for that outlet rather than lowering this number - lowering it
+   * buys no sensitivity, only false alarms. Same claim-hygiene rule that cost
+   * the feeder its feature under ADR-004. */
+  c.draw_threshold_dw = 50u;
   /* Confirm window is 60 s. */
   c.max_gap_ms = 90u * 1000u;
   return c;
