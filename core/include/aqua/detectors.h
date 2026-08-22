@@ -23,11 +23,89 @@ extern "C" {
 /* Temperatures are millidegrees Celsius (25.0 C == 25000).
  * Power is deciwatts (0.1 W), matching the wire format. */
 
+/* UNKNOWN is deliberately zero so that zeroed memory reads as "no evidence"
+ * rather than as "everything is fine". A freshly-initialised detector has not
+ * seen any data yet, and ADR-014 requires that absence of evidence must never
+ * render as an all-clear. */
 typedef enum {
-  AQUA_VERDICT_OK = 0,
-  AQUA_VERDICT_SUSPECT = 1, /* something looks wrong, not yet confirmed */
-  AQUA_VERDICT_FAULT = 2    /* confirmed; safe to alarm */
+  AQUA_VERDICT_UNKNOWN = 0, /* no data yet, or data too stale to judge */
+  AQUA_VERDICT_OK = 1,
+  AQUA_VERDICT_SUSPECT = 2, /* something looks wrong, not yet confirmed */
+  AQUA_VERDICT_FAULT = 3    /* confirmed; safe to alarm */
 } aqua_verdict_t;
+
+/* =========================================================================
+ * PROBE HEALTH  —  check this before trusting any temperature
+ *
+ * A DS18B20 has two failure values that a naive reader treats as data:
+ *
+ *   +85.000 C   the power-on scratchpad default. Means "never completed a
+ *               conversion" — usually a power or timing problem. If believed,
+ *               it makes the overheat detector's too_hot permanently true and
+ *               would open the heater relay on a healthy tank.
+ *   -127.000 C  the bus-error / no-device value. If believed, it silently
+ *               disables overheat detection forever.
+ *
+ * Both are plausible-looking int32 values. Neither is a temperature.
+ * ========================================================================= */
+
+typedef enum {
+  AQUA_PROBE_OK = 0,
+  AQUA_PROBE_POWER_ON_DEFAULT, /* exactly +85.000 C */
+  AQUA_PROBE_DISCONNECTED,     /* exactly -127.000 C */
+  AQUA_PROBE_OUT_OF_RANGE      /* outside anything an aquarium can be */
+} aqua_probe_status_t;
+
+/* Plausibility band for a freshwater aquarium probe, deliberately generous:
+ * a tank can legitimately be cold in a power cut or hot in a heatwave, but it
+ * cannot be below freezing or above 45 C and still be a tank. */
+#define AQUA_PROBE_MIN_MC 0
+#define AQUA_PROBE_MAX_MC 45000
+
+aqua_probe_status_t aqua_probe_check(int32_t raw_mc);
+
+/* =========================================================================
+ * TEMPERATURE BAND  —  the detector that watches the TANK, not the equipment
+ *
+ * Every other detector in this file requires a plug: it takes commanded_on and
+ * watts_dw. That means all of them are blind to the failures that matter most:
+ *
+ *   - the heater is unplugged, or plugged into a wall socket we do not monitor
+ *   - the plug is dead, rebooted de-energized, or out of radio range
+ *   - the relay is stuck open
+ *   - the link is down
+ *
+ * In every one of those the water goes to room temperature while the equipment
+ * detectors have nothing to report — and under ADR-014 nothing to report must
+ * not render as an all-clear.
+ *
+ * This detector needs no plug, no radio, and no current sensing. It is the
+ * alarm that outranks all the others, and the equipment detectors exist to
+ * explain WHY it fired. Target band for tropical freshwater is 22-26 C
+ * (see AQUA-PWR CLAUDE.md); alarm thresholds sit outside it with margin.
+ * ========================================================================= */
+
+typedef struct {
+  int32_t low_mc;      /* at or below this, alarm */
+  int32_t high_mc;     /* at or above this, alarm */
+  uint32_t confirm_ms; /* sustained excursion before confirming */
+} aqua_temp_band_cfg_t;
+
+typedef struct {
+  bool out_of_band;
+  uint64_t since_ms;
+  aqua_verdict_t verdict;
+} aqua_temp_band_t;
+
+void aqua_temp_band_init(aqua_temp_band_t *b);
+aqua_temp_band_cfg_t aqua_temp_band_default_cfg(void);
+
+/* Returns UNKNOWN when the probe reading is not trustworthy — which is itself
+ * an alarm condition for the UI, not an all-clear. Never returns OK on a bad
+ * probe. */
+aqua_verdict_t aqua_temp_band_update(aqua_temp_band_t *b,
+                                     const aqua_temp_band_cfg_t *cfg,
+                                     uint64_t now_ms, int32_t water_temp_mc);
 
 /* =========================================================================
  * HEATER

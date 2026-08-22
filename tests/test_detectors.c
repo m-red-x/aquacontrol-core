@@ -1,7 +1,144 @@
 #include "aqua/detectors.h"
 #include "aqua_test.h"
+#include <stddef.h>
 
 #define MIN_MS (60u * 1000u)
+
+/* ================================ probe health ============================ */
+
+/* The two DS18B20 values that look like temperatures and are not. Believing
+ * either is the classic bug: +85 C would make the overheat detector open the
+ * heater relay on a healthy tank; -127 C would silently disable it forever. */
+static void test_probe_sentinels_are_rejected(void) {
+  CHECK_EQ(aqua_probe_check(85000), AQUA_PROBE_POWER_ON_DEFAULT);
+  CHECK_EQ(aqua_probe_check(-127000), AQUA_PROBE_DISCONNECTED);
+
+  /* Adjacent real readings must still be accepted — the sentinels are exact
+   * register values, not ranges. 85.001 C is out of band, but for the range
+   * reason, not the sentinel reason. */
+  CHECK_EQ(aqua_probe_check(25000), AQUA_PROBE_OK);
+  CHECK_EQ(aqua_probe_check(84999), AQUA_PROBE_OUT_OF_RANGE);
+  CHECK_EQ(aqua_probe_check(-1), AQUA_PROBE_OUT_OF_RANGE);
+  CHECK_EQ(aqua_probe_check(0), AQUA_PROBE_OK);
+  CHECK_EQ(aqua_probe_check(45000), AQUA_PROBE_OK);
+  CHECK_EQ(aqua_probe_check(45001), AQUA_PROBE_OUT_OF_RANGE);
+}
+
+/* ============================= temperature band =========================== */
+
+/* THE DETECTOR THAT WATCHES THE TANK.
+ *
+ * Every other detector needs a plug. This one needs nothing but the probe, so
+ * it still works when the heater is unplugged, on an unmonitored socket, or
+ * the plug is dead, or the radio is down. Those are exactly the cases where
+ * the equipment detectors have nothing to say — and nothing to say must never
+ * render as an all-clear (ADR-014). */
+static void test_temp_band_catches_a_cooling_tank(void) {
+  aqua_temp_band_t b;
+  aqua_temp_band_cfg_t cfg = aqua_temp_band_default_cfg();
+  uint64_t t;
+  aqua_verdict_t v = AQUA_VERDICT_UNKNOWN;
+
+  aqua_temp_band_init(&b);
+  CHECK_EQ(b.verdict, AQUA_VERDICT_UNKNOWN); /* no data yet is not "fine" */
+
+  /* Healthy at 24 C. */
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, 0u, 24000), AQUA_VERDICT_OK);
+
+  /* Tank drifts below the low threshold and stays there. */
+  for (t = MIN_MS; t <= 20u * MIN_MS; t += MIN_MS) {
+    v = aqua_temp_band_update(&b, &cfg, t, 20500);
+  }
+  CHECK_EQ(v, AQUA_VERDICT_FAULT);
+
+  /* Recovers when the water comes back into band. */
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, 21u * MIN_MS, 24000),
+           AQUA_VERDICT_OK);
+}
+
+static void test_temp_band_catches_overheating(void) {
+  aqua_temp_band_t b;
+  aqua_temp_band_cfg_t cfg = aqua_temp_band_default_cfg();
+  uint64_t t;
+  aqua_verdict_t v = AQUA_VERDICT_UNKNOWN;
+
+  aqua_temp_band_init(&b);
+  for (t = 0; t <= 20u * MIN_MS; t += MIN_MS) {
+    v = aqua_temp_band_update(&b, &cfg, t, 29000);
+  }
+  CHECK_EQ(v, AQUA_VERDICT_FAULT);
+}
+
+/* A brief excursion is not an alarm — water has enormous thermal mass, so a
+ * fast swing is a probe or wiring artefact, not a tank. */
+static void test_temp_band_ignores_brief_excursion(void) {
+  aqua_temp_band_t b;
+  aqua_temp_band_cfg_t cfg = aqua_temp_band_default_cfg();
+
+  aqua_temp_band_init(&b);
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, 0u, 24000), AQUA_VERDICT_OK);
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, MIN_MS, 20000), AQUA_VERDICT_SUSPECT);
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, 2u * MIN_MS, 24000), AQUA_VERDICT_OK);
+}
+
+/* A bad probe must report UNKNOWN, never OK. "I cannot tell" is a state the UI
+ * must surface, not an all-clear. */
+static void test_temp_band_reports_unknown_on_bad_probe(void) {
+  aqua_temp_band_t b;
+  aqua_temp_band_cfg_t cfg = aqua_temp_band_default_cfg();
+
+  aqua_temp_band_init(&b);
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, 0u, 85000), AQUA_VERDICT_UNKNOWN);
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, MIN_MS, -127000), AQUA_VERDICT_UNKNOWN);
+  CHECK_EQ(aqua_temp_band_update(&b, &cfg, 2u * MIN_MS, 24000), AQUA_VERDICT_OK);
+}
+
+/* ⚠️ THE ONE THAT WOULD COOK A TANK IN WINTER.
+ *
+ * A probe stuck at its +85 C power-on default makes too_hot permanently true.
+ * The overheat detector's FAULT is meant to OPEN THE HEATER RELAY. If it
+ * believed a bad probe, it would cut heat to a healthy tank and keep it off. */
+static void test_overheat_never_acts_on_a_bad_probe(void) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  uint64_t t;
+  aqua_verdict_t v = AQUA_VERDICT_UNKNOWN;
+
+  aqua_overheat_init(&o);
+  for (t = 0; t <= 120u * MIN_MS; t += MIN_MS) {
+    v = aqua_overheat_update(&o, &cfg, t, true, 250u, 85000, 25000);
+    CHECK(v != AQUA_VERDICT_FAULT); /* must NEVER reach the relay-opening state */
+  }
+  CHECK_EQ(v, AQUA_VERDICT_SUSPECT);
+}
+
+/* A disconnected probe reading -127 C would make the apparent temperature drop
+ * enormous and fire a false "heater dead". */
+static void test_heater_reports_unknown_on_bad_probe(void) {
+  aqua_heater_t h;
+  aqua_heater_cfg_t cfg = aqua_heater_default_cfg();
+  uint64_t t;
+  aqua_verdict_t v = AQUA_VERDICT_UNKNOWN;
+
+  aqua_heater_init(&h);
+  for (t = 0; t <= 200u * MIN_MS; t += MIN_MS) {
+    v = aqua_heater_update(&h, &cfg, t, true, 0u, -127000);
+  }
+  CHECK_EQ(v, AQUA_VERDICT_UNKNOWN);
+}
+
+/* Zeroed memory must read as "no evidence", not as "everything is fine".
+ * This is what makes UNKNOWN == 0 worth having. */
+static void test_zeroed_detector_is_unknown_not_ok(void) {
+  aqua_temp_band_t b;
+  unsigned char *p = (unsigned char *)&b;
+  size_t i;
+  for (i = 0; i < sizeof(b); i++) {
+    p[i] = 0;
+  }
+  CHECK_EQ(b.verdict, AQUA_VERDICT_UNKNOWN);
+  CHECK(b.verdict != AQUA_VERDICT_OK);
+}
 
 /* ============================================================================
  * THE MOST IMPORTANT TEST IN THIS REPO.
@@ -289,6 +426,14 @@ static void test_o2_interpolates_and_clamps(void) {
 }
 
 int main(void) {
+  test_probe_sentinels_are_rejected();
+  test_temp_band_catches_a_cooling_tank();
+  test_temp_band_catches_overheating();
+  test_temp_band_ignores_brief_excursion();
+  test_temp_band_reports_unknown_on_bad_probe();
+  test_overheat_never_acts_on_a_bad_probe();
+  test_heater_reports_unknown_on_bad_probe();
+  test_zeroed_detector_is_unknown_not_ok();
   test_healthy_heater_never_alarms_over_a_full_day();
   test_dead_heater_is_detected();
   test_zero_draw_but_stable_temp_is_only_suspect();

@@ -11,6 +11,86 @@ static uint64_t elapsed_since(uint64_t now_ms, uint64_t *since_ms) {
   return now_ms - *since_ms;
 }
 
+/* --------------------------------------------------------- probe health -- */
+
+aqua_probe_status_t aqua_probe_check(int32_t raw_mc) {
+  /* Exact sentinel matches first — these are specific register values, not
+   * ranges, and treating them as temperatures is the classic DS18B20 bug. */
+  if (raw_mc == 85000) {
+    return AQUA_PROBE_POWER_ON_DEFAULT;
+  }
+  if (raw_mc == -127000) {
+    return AQUA_PROBE_DISCONNECTED;
+  }
+  if (raw_mc < AQUA_PROBE_MIN_MC || raw_mc > AQUA_PROBE_MAX_MC) {
+    return AQUA_PROBE_OUT_OF_RANGE;
+  }
+  return AQUA_PROBE_OK;
+}
+
+/* ------------------------------------------------------- temperature band -- */
+
+void aqua_temp_band_init(aqua_temp_band_t *b) {
+  if (b == NULL) {
+    return;
+  }
+  b->out_of_band = false;
+  b->since_ms = 0u;
+  b->verdict = AQUA_VERDICT_UNKNOWN;
+}
+
+aqua_temp_band_cfg_t aqua_temp_band_default_cfg(void) {
+  aqua_temp_band_cfg_t c;
+  /* Target band is 22-26 C. Alarm outside it with margin, so ordinary daily
+   * drift and probe tolerance do not produce nuisance alarms. */
+  c.low_mc = 21000;  /* 21.0 C */
+  c.high_mc = 28000; /* 28.0 C */
+  /* 10 minutes. Water has enormous thermal mass, so a genuine excursion is
+   * slow and sustained; anything faster is a probe or wiring artefact. */
+  c.confirm_ms = 10u * 60u * 1000u;
+  return c;
+}
+
+aqua_verdict_t aqua_temp_band_update(aqua_temp_band_t *b,
+                                     const aqua_temp_band_cfg_t *cfg,
+                                     uint64_t now_ms, int32_t water_temp_mc) {
+  bool outside;
+
+  if (b == NULL || cfg == NULL) {
+    return AQUA_VERDICT_UNKNOWN;
+  }
+
+  /* An untrustworthy probe is not an all-clear. Report UNKNOWN and let the UI
+   * surface it as "temperature unavailable" — never as OK (ADR-014). */
+  if (aqua_probe_check(water_temp_mc) != AQUA_PROBE_OK) {
+    b->out_of_band = false;
+    b->verdict = AQUA_VERDICT_UNKNOWN;
+    return b->verdict;
+  }
+
+  outside = (water_temp_mc <= cfg->low_mc) || (water_temp_mc >= cfg->high_mc);
+
+  if (!outside) {
+    b->out_of_band = false;
+    b->verdict = AQUA_VERDICT_OK;
+    return b->verdict;
+  }
+
+  if (!b->out_of_band) {
+    b->out_of_band = true;
+    b->since_ms = now_ms;
+    b->verdict = AQUA_VERDICT_SUSPECT;
+    return b->verdict;
+  }
+
+  if (elapsed_since(now_ms, &b->since_ms) >= cfg->confirm_ms) {
+    b->verdict = AQUA_VERDICT_FAULT;
+  } else {
+    b->verdict = AQUA_VERDICT_SUSPECT;
+  }
+  return b->verdict;
+}
+
 /* ---------------------------------------------------------------- heater -- */
 
 void aqua_heater_init(aqua_heater_t *h) {
@@ -20,7 +100,7 @@ void aqua_heater_init(aqua_heater_t *h) {
   h->zero_draw_active = false;
   h->zero_draw_since_ms = 0u;
   h->temp_at_zero_start_mc = 0;
-  h->verdict = AQUA_VERDICT_OK;
+  h->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
 aqua_heater_cfg_t aqua_heater_default_cfg(void) {
@@ -40,7 +120,16 @@ aqua_verdict_t aqua_heater_update(aqua_heater_t *h, const aqua_heater_cfg_t *cfg
   int32_t drop;
 
   if (h == NULL || cfg == NULL) {
-    return AQUA_VERDICT_OK;
+    return AQUA_VERDICT_UNKNOWN;
+  }
+
+  /* A bad probe poisons the temperature-drop comparison this detector depends
+   * on: a reading of -127 C makes the apparent drop enormous and would fire a
+   * false "heater dead". We cannot judge without a trustworthy temperature. */
+  if (aqua_probe_check(water_temp_mc) != AQUA_PROBE_OK) {
+    h->zero_draw_active = false;
+    h->verdict = AQUA_VERDICT_UNKNOWN;
+    return h->verdict;
   }
 
   /* Drawing power, or not asked to heat: healthy either way.
@@ -83,7 +172,7 @@ void aqua_weld_init(aqua_weld_t *w) {
   }
   w->draw_while_off = false;
   w->draw_since_ms = 0u;
-  w->verdict = AQUA_VERDICT_OK;
+  w->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
 aqua_weld_cfg_t aqua_weld_default_cfg(void) {
@@ -97,7 +186,7 @@ aqua_verdict_t aqua_weld_update(aqua_weld_t *w, const aqua_weld_cfg_t *cfg,
                                 uint64_t now_ms, bool commanded_on,
                                 uint16_t watts_dw) {
   if (w == NULL || cfg == NULL) {
-    return AQUA_VERDICT_OK;
+    return AQUA_VERDICT_UNKNOWN;
   }
 
   /* Latched: contacts do not un-weld, and an alarm the owner may not have seen
@@ -135,7 +224,7 @@ void aqua_overheat_init(aqua_overheat_t *o) {
   }
   o->continuous_draw = false;
   o->draw_since_ms = 0u;
-  o->verdict = AQUA_VERDICT_OK;
+  o->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
 aqua_overheat_cfg_t aqua_overheat_default_cfg(void) {
@@ -159,12 +248,23 @@ aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
   bool drawing;
 
   if (o == NULL || cfg == NULL) {
-    return AQUA_VERDICT_OK;
+    return AQUA_VERDICT_UNKNOWN;
   }
 
   /* Latched: an overheated tank needs a human, and the heater does not fix
    * itself. aqua_overheat_init() resets it after the heater is replaced. */
   if (o->verdict == AQUA_VERDICT_FAULT) {
+    return o->verdict;
+  }
+
+  /* NEVER act on an untrustworthy probe. A DS18B20 stuck at its +85 C power-on
+   * default would make too_hot permanently true — and this is the one detector
+   * whose FAULT is meant to open the heater relay. Believing a bad probe here
+   * would cut heat to a healthy tank in winter. Report SUSPECT: something is
+   * wrong, but not something we may act on. */
+  if (aqua_probe_check(water_temp_mc) != AQUA_PROBE_OK) {
+    o->continuous_draw = false;
+    o->verdict = AQUA_VERDICT_SUSPECT;
     return o->verdict;
   }
 
@@ -208,7 +308,7 @@ void aqua_pump_init(aqua_pump_t *p) {
   }
   p->no_draw_active = false;
   p->no_draw_since_ms = 0u;
-  p->verdict = AQUA_VERDICT_OK;
+  p->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
 aqua_pump_cfg_t aqua_pump_default_cfg(void) {
@@ -222,7 +322,7 @@ aqua_verdict_t aqua_pump_update(aqua_pump_t *p, const aqua_pump_cfg_t *cfg,
                                 uint64_t now_ms, bool commanded_on,
                                 uint16_t watts_dw) {
   if (p == NULL || cfg == NULL) {
-    return AQUA_VERDICT_OK;
+    return AQUA_VERDICT_UNKNOWN;
   }
 
   if (!commanded_on || watts_dw > cfg->draw_threshold_dw) {
