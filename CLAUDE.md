@@ -145,6 +145,21 @@ forward compatibility, no TLVs, and no version negotiation — an older *or* new
 outright, not degraded. While major is 0 that is fine: flash both ends together. It becomes a real
 constraint after ADR-013, because customers flash their own plugs and there is no fleet update path.
 
+**`AQUA_FRAME_SENSOR` (type 6) is defined but unused.** A rim-clip sensor node — electronics, cell
+and antenna **in air**, probe in the water on its existing lead. ⚠️ **Never submerged, and that is
+physics, not a preference**: water's *microwave* refractive index is ~8.8 (not the optical 1.33),
+giving a 6.5° critical angle and a ~29 dB escape-cone floor that is *depth-independent*. More TX
+power does not help. See ADR-015 — do not re-open it, and do not test it in a bucket, because a
+shallow bucket leaks signal through the air above the surface and looks encouraging.
+
+Temperature crosses the wire in **millidegrees**, the same unit `core/` uses, specifically so the
+DS18B20 fault sentinels survive byte-identically and `aqua_probe_check()` still classifies them on
+the far side. A disconnected probe arriving as a plausible temperature would be the exact false
+all-clear ADR-014 forbids. There is a test pinning it.
+
+⚠️ **A sleeping node looks exactly like a dead one** under `max_gap_ms`. Unsolved, and it must be
+solved before any node firmware — probably by having the node declare its reporting interval.
+
 **The stop-list.** These have all been proposed and all declined until real S0 data exists. Do not
 add them because they are "only two bytes": no `src` field (the `dev` byte already is the device id,
 and ESP-NOW hands you the sender MAC free in `esp_now_recv_info_t`), no site id, no `cmd_id`, no
