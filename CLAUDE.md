@@ -40,8 +40,9 @@ ID=$("$GH" run list --repo m-red-x/aquacontrol-core --limit 1 --json databaseId 
 ## The purity rules — CI-enforced, and the whole point
 
 `core/` and `protocol/` must contain **no platform headers** (`esp_*.h`, `freertos/`, `driver/`,
-`Arduino.h`), **no heap allocation**, **no clock reads**, and **no I/O**. Hardware is reached through
-a `ports` struct of function pointers; time arrives as an explicit `uint64_t now_ms` parameter.
+`Arduino.h`), **no heap allocation**, **no clock reads**, and **no I/O**. Time arrives as an explicit
+`uint64_t now_ms` parameter, and any hardware value a detector needs — watts, temperature, relay
+state — is passed in by the caller. There is no indirection layer and none is needed.
 
 `tools/check_purity.sh` fails the build if that erodes. It strips whole-line comments and requires an
 opening paren, so prose *about* the rules is not mistaken for a breach.
