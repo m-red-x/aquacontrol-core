@@ -141,6 +141,96 @@ static void test_weld_ignores_switching_transient(void) {
   CHECK_EQ(aqua_weld_update(&w, &cfg, 1000u, false, 0u), AQUA_VERDICT_OK);
 }
 
+/* ------------------------------------------- heater thermostat stuck ------ */
+
+/* The failure that actually cooks a tank: the heater's own thermostat sticks
+ * closed, so it draws continuously and the water climbs past target. */
+static void test_stuck_thermostat_is_detected(void) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  uint64_t t;
+  int32_t temp = 25000;
+  const int32_t target = 25000;
+  aqua_verdict_t v = AQUA_VERDICT_OK;
+
+  aqua_overheat_init(&o);
+
+  /* Heater never releases; water climbs 0.1 C every 5 minutes. */
+  for (t = 0; t <= 90u * MIN_MS; t += MIN_MS) {
+    if (t > 0 && (t / MIN_MS) % 5u == 0u) {
+      temp += 100;
+    }
+    v = aqua_overheat_update(&o, &cfg, t, true, 250u, temp, target);
+  }
+  CHECK_EQ(v, AQUA_VERDICT_FAULT);
+
+  /* Latched — an overheated tank needs a human. */
+  v = aqua_overheat_update(&o, &cfg, 95u * MIN_MS, true, 0u, target, target);
+  CHECK_EQ(v, AQUA_VERDICT_FAULT);
+}
+
+/* A healthy heater cycles. Any break in the draw clears the timer, so normal
+ * operation must never trip this — including on a cold morning when the heater
+ * works unusually hard. */
+static void test_cycling_heater_never_trips_overheat(void) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  uint64_t t;
+  int worst = AQUA_VERDICT_OK;
+
+  aqua_overheat_init(&o);
+
+  /* Cold room: 30 min ON, 10 min OFF, for 24 h. Long duty, but it cycles. */
+  for (t = 0; t < 24u * 60u * MIN_MS; t += MIN_MS) {
+    uint64_t phase = (t / MIN_MS) % 40u;
+    bool heating = (phase < 30u);
+    aqua_verdict_t v = aqua_overheat_update(
+        &o, &cfg, t, true, heating ? 250u : 0u, 24800, 25000);
+    if ((int)v > worst) {
+      worst = (int)v;
+    }
+  }
+  CHECK_EQ(worst, AQUA_VERDICT_OK);
+}
+
+/* Continuous draw while the water is still BELOW target is a heater working
+ * hard, not a stuck one. Suspect it, do not cut the power on it. */
+static void test_continuous_draw_but_cold_is_not_a_fault(void) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  uint64_t t;
+  aqua_verdict_t v = AQUA_VERDICT_OK;
+
+  aqua_overheat_init(&o);
+  for (t = 0; t <= 90u * MIN_MS; t += MIN_MS) {
+    v = aqua_overheat_update(&o, &cfg, t, true, 250u, 23000, 25000);
+  }
+  CHECK_EQ(v, AQUA_VERDICT_SUSPECT);
+}
+
+/* A welded PLUG relay and a stuck HEATER thermostat are different faults with
+ * different signatures. This pins the distinction so it cannot quietly rot. */
+static void test_weld_and_overheat_are_distinct(void) {
+  aqua_weld_t w;
+  aqua_overheat_t o;
+  aqua_weld_cfg_t wc = aqua_weld_default_cfg();
+  aqua_overheat_cfg_t oc = aqua_overheat_default_cfg();
+
+  aqua_weld_init(&w);
+  aqua_overheat_init(&o);
+
+  /* Commanded OFF, current flowing = welded plug relay. The overheat detector
+   * must stay quiet: this is not the tank-cooking failure. */
+  CHECK_EQ(aqua_weld_update(&w, &wc, 6000u, false, 3000u), AQUA_VERDICT_FAULT);
+  CHECK_EQ(aqua_overheat_update(&o, &oc, 6000u, false, 3000u, 25000, 25000),
+           AQUA_VERDICT_OK);
+
+  /* Commanded ON with normal current = healthy. The weld detector must stay
+   * quiet: current while commanded ON is exactly what should happen. */
+  aqua_weld_init(&w);
+  CHECK_EQ(aqua_weld_update(&w, &wc, 0u, true, 3000u), AQUA_VERDICT_OK);
+}
+
 /* ---------------------------------------------------------------- pump ---- */
 
 static void test_pump_stopped_detected(void) {
@@ -199,6 +289,10 @@ int main(void) {
   test_weld_detected_and_latches();
   test_weld_quiet_when_relay_commanded_on();
   test_weld_ignores_switching_transient();
+  test_stuck_thermostat_is_detected();
+  test_cycling_heater_never_trips_overheat();
+  test_continuous_draw_but_cold_is_not_a_fault();
+  test_weld_and_overheat_are_distinct();
   test_pump_stopped_detected();
   test_pump_quiet_when_running();
   test_o2_capacity_matches_reference_table();

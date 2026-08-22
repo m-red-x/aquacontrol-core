@@ -109,6 +109,60 @@ aqua_verdict_t aqua_weld_update(aqua_weld_t *w, const aqua_weld_cfg_t *cfg,
                                 uint16_t watts_dw);
 
 /* =========================================================================
+ * HEATER THERMOSTAT STUCK CLOSED  —  the failure that actually cooks tanks
+ *
+ * This is a DIFFERENT detector from the relay-weld check above, and confusing
+ * the two is a claim-hygiene error worth stating plainly:
+ *
+ *   aqua_weld_*      commanded OFF, current flowing
+ *                    -> the contacts in OUR plug have welded.
+ *                    Largely BENIGN on its own: the heater's own thermostat
+ *                    still regulates the tank. It is a fault to report and a
+ *                    part to replace, not usually a dead tank.
+ *
+ *   aqua_overheat_*  commanded ON, current flowing CONTINUOUSLY, and the
+ *                    water is above target and still climbing
+ *                    -> the heater's INTERNAL bimetal thermostat has stuck
+ *                    closed. This is the failure that boils a tank overnight,
+ *                    and it is the reason this product exists.
+ *
+ * Note the asymmetry in what we can do about each. For a welded plug relay,
+ * cutting power does nothing — the contacts are already shut. For a stuck
+ * heater thermostat, opening the plug relay is the ONE intervention that
+ * actually saves the tank. That makes this the only detector in the product
+ * with a genuine control response rather than just an alarm.
+ *
+ * Requires the hub's temperature probe: current alone cannot distinguish a
+ * heater working hard on a cold morning from a heater that will not stop.
+ * ========================================================================= */
+
+typedef struct {
+  uint32_t min_continuous_draw_ms; /* longer than any healthy heating run */
+  uint16_t draw_threshold_dw;      /* above this the heater is drawing */
+  int32_t over_target_mc;          /* how far above target counts as overheating */
+} aqua_overheat_cfg_t;
+
+typedef struct {
+  bool continuous_draw;
+  uint64_t draw_since_ms;
+  aqua_verdict_t verdict;
+} aqua_overheat_t;
+
+void aqua_overheat_init(aqua_overheat_t *o);
+aqua_overheat_cfg_t aqua_overheat_default_cfg(void);
+
+/* Latches: a tank that has been overheated needs a human to look at it, and
+ * the heater does not repair itself. Re-init only after the heater is replaced.
+ *
+ * When this returns AQUA_VERDICT_FAULT the correct response is to command the
+ * outlet OFF as well as alarm. */
+aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
+                                    const aqua_overheat_cfg_t *cfg,
+                                    uint64_t now_ms, bool commanded_on,
+                                    uint16_t watts_dw, int32_t water_temp_mc,
+                                    int32_t target_temp_mc);
+
+/* =========================================================================
  * PUMP
  *
  * HONEST LIMITS — do not overclaim this one in the UI.

@@ -127,6 +127,79 @@ aqua_verdict_t aqua_weld_update(aqua_weld_t *w, const aqua_weld_cfg_t *cfg,
   return w->verdict;
 }
 
+/* ------------------------------------------------- heater thermostat stuck -- */
+
+void aqua_overheat_init(aqua_overheat_t *o) {
+  if (o == NULL) {
+    return;
+  }
+  o->continuous_draw = false;
+  o->draw_since_ms = 0u;
+  o->verdict = AQUA_VERDICT_OK;
+}
+
+aqua_overheat_cfg_t aqua_overheat_default_cfg(void) {
+  aqua_overheat_cfg_t c;
+  /* 45 minutes of UNBROKEN draw. A healthy heater on the coldest morning of
+   * the year still cycles; one that never releases is not thermostatting.
+   * Tune from the S0 traces — the longest healthy ON run you actually observe,
+   * with margin. */
+  c.min_continuous_draw_ms = 45u * 60u * 1000u;
+  c.draw_threshold_dw = 50u; /* 5.0 W */
+  c.over_target_mc = 1000;   /* 1.0 C above target */
+  return c;
+}
+
+aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
+                                    const aqua_overheat_cfg_t *cfg,
+                                    uint64_t now_ms, bool commanded_on,
+                                    uint16_t watts_dw, int32_t water_temp_mc,
+                                    int32_t target_temp_mc) {
+  bool too_hot;
+  bool drawing;
+
+  if (o == NULL || cfg == NULL) {
+    return AQUA_VERDICT_OK;
+  }
+
+  /* Latched: an overheated tank needs a human, and the heater does not fix
+   * itself. aqua_overheat_init() resets it after the heater is replaced. */
+  if (o->verdict == AQUA_VERDICT_FAULT) {
+    return o->verdict;
+  }
+
+  drawing = commanded_on && (watts_dw > cfg->draw_threshold_dw);
+
+  /* Any break in the draw means the thermostat is still working. */
+  if (!drawing) {
+    o->continuous_draw = false;
+    o->verdict = AQUA_VERDICT_OK;
+    return o->verdict;
+  }
+
+  if (!o->continuous_draw) {
+    o->continuous_draw = true;
+    o->draw_since_ms = now_ms;
+    o->verdict = AQUA_VERDICT_OK;
+    return o->verdict;
+  }
+
+  too_hot = (water_temp_mc > (target_temp_mc + cfg->over_target_mc));
+
+  if (elapsed_since(now_ms, &o->draw_since_ms) < cfg->min_continuous_draw_ms) {
+    /* Still a plausible long heating run. But if the water is ALREADY over
+     * target and the heater has not released, that is worth flagging early —
+     * a correctly working thermostat would have opened by now. */
+    o->verdict = too_hot ? AQUA_VERDICT_SUSPECT : AQUA_VERDICT_OK;
+    return o->verdict;
+  }
+
+  /* Drawing without pause for longer than any healthy run. If the water is
+   * also over target, the internal thermostat has stuck closed. */
+  o->verdict = too_hot ? AQUA_VERDICT_FAULT : AQUA_VERDICT_SUSPECT;
+  return o->verdict;
+}
+
 /* ------------------------------------------------------------------ pump -- */
 
 void aqua_pump_init(aqua_pump_t *p) {
