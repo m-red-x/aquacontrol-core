@@ -23,10 +23,35 @@ extern "C" {
 /* Temperatures are millidegrees Celsius (25.0 C == 25000).
  * Power is deciwatts (0.1 W), matching the wire format. */
 
+/* =========================================================================
+ * SAMPLE CONTINUITY  —  read this before changing any detector
+ *
+ * Every detector here measures "this condition has held for N minutes". It can
+ * only observe the samples it is given, so if it is fed two samples an hour
+ * apart it has NO IDEA what happened in between.
+ *
+ * That matters because the samples arrive over a radio. The hub sleeps, the
+ * plug buffers events, peers drop out. A three-hour ESP-NOW dropout would
+ * otherwise look identical to three hours of continuously observed evidence —
+ * and for the overheat detector, whose FAULT opens the heater relay, that would
+ * cut heat to a healthy tank in winter and latch until a firmware reset.
+ *
+ * So every cfg carries max_gap_ms. A sample arriving later than that does not
+ * extend a window: it RESTARTS it and reports UNKNOWN. Under ADR-014 a gap is a
+ * negative state, not an absence of one — "I stopped hearing from this plug"
+ * must never render as "everything is fine".
+ *
+ * The same applies to the clock stepping BACKWARDS. The hub has a DS3231 and no
+ * NTP, Bulgaria observes DST, and a battery device can reboot with now_ms back
+ * at zero. A backwards step must not clear a fault or silently restart a
+ * confirmation timer in the safe-looking direction.
+ * ========================================================================= */
+
 /* UNKNOWN is deliberately zero so that zeroed memory reads as "no evidence"
  * rather than as "everything is fine". A freshly-initialised detector has not
  * seen any data yet, and ADR-014 requires that absence of evidence must never
- * render as an all-clear. */
+ * render as an all-clear. UNKNOWN also covers "the samples were too far apart,
+ * or the clock moved, so I cannot judge" — see SAMPLE CONTINUITY above. */
 typedef enum {
   AQUA_VERDICT_UNKNOWN = 0, /* no data yet, or data too stale to judge */
   AQUA_VERDICT_OK = 1,
@@ -89,12 +114,15 @@ typedef struct {
   int32_t low_mc;      /* at or below this, alarm */
   int32_t high_mc;     /* at or above this, alarm */
   uint32_t confirm_ms; /* sustained excursion before confirming */
+  uint32_t max_gap_ms;         /* longest silence we will bridge; see note above */
 } aqua_temp_band_cfg_t;
 
 typedef struct {
   bool out_of_band;
   uint64_t since_ms;
   aqua_verdict_t verdict;
+  uint64_t last_update_ms;
+  bool has_last;
 } aqua_temp_band_t;
 
 void aqua_temp_band_init(aqua_temp_band_t *b);
@@ -132,6 +160,7 @@ typedef struct {
   uint32_t min_zero_draw_ms;   /* longer than the longest healthy OFF period */
   uint16_t draw_threshold_dw;  /* above this the heater is considered drawing */
   int32_t confirm_temp_drop_mc; /* required fall (millidegC) to confirm a fault */
+  uint32_t max_gap_ms;         /* longest silence we will bridge; see note above */
 } aqua_heater_cfg_t;
 
 typedef struct {
@@ -139,6 +168,8 @@ typedef struct {
   uint64_t zero_draw_since_ms;
   int32_t temp_at_zero_start_mc;
   aqua_verdict_t verdict;
+  uint64_t last_update_ms;
+  bool has_last;
 } aqua_heater_t;
 
 void aqua_heater_init(aqua_heater_t *h);
@@ -168,12 +199,15 @@ aqua_verdict_t aqua_heater_update(aqua_heater_t *h, const aqua_heater_cfg_t *cfg
 typedef struct {
   uint32_t confirm_ms;        /* sustained draw before confirming */
   uint16_t draw_threshold_dw; /* above this, current is genuinely flowing */
+  uint32_t max_gap_ms;         /* longest silence we will bridge; see note above */
 } aqua_weld_cfg_t;
 
 typedef struct {
   bool draw_while_off;
   uint64_t draw_since_ms;
   aqua_verdict_t verdict;
+  uint64_t last_update_ms;
+  bool has_last;
 } aqua_weld_t;
 
 void aqua_weld_init(aqua_weld_t *w);
@@ -218,12 +252,16 @@ typedef struct {
   uint32_t min_continuous_draw_ms; /* longer than any healthy heating run */
   uint16_t draw_threshold_dw;      /* above this the heater is drawing */
   int32_t over_target_mc;          /* how far above target counts as overheating */
+  uint32_t max_gap_ms;         /* longest silence we will bridge; see note above */
 } aqua_overheat_cfg_t;
 
 typedef struct {
   bool continuous_draw;
   uint64_t draw_since_ms;
+  int32_t temp_at_draw_start_mc;
   aqua_verdict_t verdict;
+  uint64_t last_update_ms;
+  bool has_last;
 } aqua_overheat_t;
 
 void aqua_overheat_init(aqua_overheat_t *o);
@@ -259,12 +297,15 @@ aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
 typedef struct {
   uint32_t confirm_ms;
   uint16_t draw_threshold_dw;
+  uint32_t max_gap_ms;         /* longest silence we will bridge; see note above */
 } aqua_pump_cfg_t;
 
 typedef struct {
   bool no_draw_active;
   uint64_t no_draw_since_ms;
   aqua_verdict_t verdict;
+  uint64_t last_update_ms;
+  bool has_last;
 } aqua_pump_t;
 
 void aqua_pump_init(aqua_pump_t *p);

@@ -11,6 +11,30 @@ static uint64_t elapsed_since(uint64_t now_ms, uint64_t *since_ms) {
   return now_ms - *since_ms;
 }
 
+/* Can this sample be joined to the previous one?
+ *
+ * Returns false when too much time has passed, or when the clock stepped
+ * backwards. In BOTH cases we have no idea what happened in the interval, so it
+ * must not be counted as observed evidence — see SAMPLE CONTINUITY in the
+ * header. Always updates the reference, so one gap costs one sample, not a
+ * permanent stall. */
+static bool sample_continuous(uint64_t now_ms, uint64_t *last_ms, bool *has_last,
+                              uint32_t max_gap_ms) {
+  bool ok;
+
+  if (!*has_last) {
+    ok = true; /* first sample: nothing to bridge, and no gap either */
+  } else if (now_ms < *last_ms) {
+    ok = false; /* clock stepped backwards */
+  } else {
+    ok = ((now_ms - *last_ms) <= (uint64_t)max_gap_ms);
+  }
+
+  *last_ms = now_ms;
+  *has_last = true;
+  return ok;
+}
+
 /* --------------------------------------------------------- probe health -- */
 
 aqua_probe_status_t aqua_probe_check(int32_t raw_mc) {
@@ -36,6 +60,8 @@ void aqua_temp_band_init(aqua_temp_band_t *b) {
   }
   b->out_of_band = false;
   b->since_ms = 0u;
+  b->last_update_ms = 0u;
+  b->has_last = false;
   b->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
@@ -48,6 +74,8 @@ aqua_temp_band_cfg_t aqua_temp_band_default_cfg(void) {
   /* 10 minutes. Water has enormous thermal mass, so a genuine excursion is
    * slow and sustained; anything faster is a probe or wiring artefact. */
   c.confirm_ms = 10u * 60u * 1000u;
+  /* Probe is local; 5 minutes of silence means the reader has stalled. */
+  c.max_gap_ms = 5u * 60u * 1000u;
   return c;
 }
 
@@ -58,6 +86,16 @@ aqua_verdict_t aqua_temp_band_update(aqua_temp_band_t *b,
 
   if (b == NULL || cfg == NULL) {
     return AQUA_VERDICT_UNKNOWN;
+  }
+
+  /* A gap or a backwards clock step means the interval was not observed, so it
+   * cannot count as evidence. Restart the window and report UNKNOWN — under
+   * ADR-014 "I stopped hearing about this" is a state, not an all-clear. */
+  if (!sample_continuous(now_ms, &b->last_update_ms, &b->has_last,
+                         cfg->max_gap_ms)) {
+    b->out_of_band = false;
+    b->verdict = AQUA_VERDICT_UNKNOWN;
+    return b->verdict;
   }
 
   /* An untrustworthy probe is not an all-clear. Report UNKNOWN and let the UI
@@ -100,6 +138,8 @@ void aqua_heater_init(aqua_heater_t *h) {
   h->zero_draw_active = false;
   h->zero_draw_since_ms = 0u;
   h->temp_at_zero_start_mc = 0;
+  h->last_update_ms = 0u;
+  h->has_last = false;
   h->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
@@ -111,6 +151,10 @@ aqua_heater_cfg_t aqua_heater_default_cfg(void) {
   c.min_zero_draw_ms = 90u * 60u * 1000u;
   c.draw_threshold_dw = 50u;    /* 5.0 W — well above metering noise */
   c.confirm_temp_drop_mc = 500; /* 0.5 C fall confirms it is genuinely dead */
+  /* Radio-fed, so well under the 90 min window: a real dropout resets it
+   * rather than being counted as observed evidence. Tune to the actual plug
+   * report interval once S0 and Wave 3 establish one. */
+  c.max_gap_ms = 10u * 60u * 1000u;
   return c;
 }
 
@@ -121,6 +165,16 @@ aqua_verdict_t aqua_heater_update(aqua_heater_t *h, const aqua_heater_cfg_t *cfg
 
   if (h == NULL || cfg == NULL) {
     return AQUA_VERDICT_UNKNOWN;
+  }
+
+  /* A gap or a backwards clock step means the interval was not observed, so it
+   * cannot count as evidence. Restart the window and report UNKNOWN — under
+   * ADR-014 "I stopped hearing about this" is a state, not an all-clear. */
+  if (!sample_continuous(now_ms, &h->last_update_ms, &h->has_last,
+                         cfg->max_gap_ms)) {
+    h->zero_draw_active = false;
+    h->verdict = AQUA_VERDICT_UNKNOWN;
+    return h->verdict;
   }
 
   /* A bad probe poisons the temperature-drop comparison this detector depends
@@ -172,6 +226,8 @@ void aqua_weld_init(aqua_weld_t *w) {
   }
   w->draw_while_off = false;
   w->draw_since_ms = 0u;
+  w->last_update_ms = 0u;
+  w->has_last = false;
   w->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
@@ -179,6 +235,9 @@ aqua_weld_cfg_t aqua_weld_default_cfg(void) {
   aqua_weld_cfg_t c;
   c.confirm_ms = 5u * 1000u;  /* 5 s rules out switching transients */
   c.draw_threshold_dw = 50u;  /* 5.0 W */
+  /* Confirm window is only 5 s, so gap tolerance must be tight - otherwise
+   * two distant samples would 'confirm' a weld nobody observed. */
+  c.max_gap_ms = 15u * 1000u;
   return c;
 }
 
@@ -192,6 +251,16 @@ aqua_verdict_t aqua_weld_update(aqua_weld_t *w, const aqua_weld_cfg_t *cfg,
   /* Latched: contacts do not un-weld, and an alarm the owner may not have seen
    * must not silently clear. aqua_weld_init() resets it after real repair. */
   if (w->verdict == AQUA_VERDICT_FAULT) {
+    return w->verdict;
+  }
+
+  /* A gap or a backwards clock step means the interval was not observed, so it
+   * cannot count as evidence. Restart the window and report UNKNOWN — under
+   * ADR-014 "I stopped hearing about this" is a state, not an all-clear. */
+  if (!sample_continuous(now_ms, &w->last_update_ms, &w->has_last,
+                         cfg->max_gap_ms)) {
+    w->draw_while_off = false;
+    w->verdict = AQUA_VERDICT_UNKNOWN;
     return w->verdict;
   }
 
@@ -224,6 +293,9 @@ void aqua_overheat_init(aqua_overheat_t *o) {
   }
   o->continuous_draw = false;
   o->draw_since_ms = 0u;
+  o->temp_at_draw_start_mc = 0;
+  o->last_update_ms = 0u;
+  o->has_last = false;
   o->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
@@ -236,6 +308,9 @@ aqua_overheat_cfg_t aqua_overheat_default_cfg(void) {
   c.min_continuous_draw_ms = 45u * 60u * 1000u;
   c.draw_threshold_dw = 50u; /* 5.0 W */
   c.over_target_mc = 1000;   /* 1.0 C above target */
+  /* This detector's FAULT OPENS THE HEATER RELAY, so it is the one that must
+   * never be fooled by a dropout. Well under the 45 min window. */
+  c.max_gap_ms = 10u * 60u * 1000u;
   return c;
 }
 
@@ -245,6 +320,7 @@ aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
                                     uint16_t watts_dw, int32_t water_temp_mc,
                                     int32_t target_temp_mc) {
   bool too_hot;
+  bool climbing;
   bool drawing;
 
   if (o == NULL || cfg == NULL) {
@@ -254,6 +330,16 @@ aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
   /* Latched: an overheated tank needs a human, and the heater does not fix
    * itself. aqua_overheat_init() resets it after the heater is replaced. */
   if (o->verdict == AQUA_VERDICT_FAULT) {
+    return o->verdict;
+  }
+
+  /* A gap or a backwards clock step means the interval was not observed, so it
+   * cannot count as evidence. Restart the window and report UNKNOWN — under
+   * ADR-014 "I stopped hearing about this" is a state, not an all-clear. */
+  if (!sample_continuous(now_ms, &o->last_update_ms, &o->has_last,
+                         cfg->max_gap_ms)) {
+    o->continuous_draw = false;
+    o->verdict = AQUA_VERDICT_UNKNOWN;
     return o->verdict;
   }
 
@@ -280,23 +366,29 @@ aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
   if (!o->continuous_draw) {
     o->continuous_draw = true;
     o->draw_since_ms = now_ms;
+    o->temp_at_draw_start_mc = water_temp_mc;
     o->verdict = AQUA_VERDICT_OK;
     return o->verdict;
   }
 
   too_hot = (water_temp_mc > (target_temp_mc + cfg->over_target_mc));
+  /* "Still climbing" — the header and README both claim this, so implement it.
+   * A tank sitting a degree over target but no longer rising is at equilibrium,
+   * not running away, and this detector's FAULT opens the heater relay. Require
+   * both before taking that action. */
+  climbing = (water_temp_mc > o->temp_at_draw_start_mc);
 
   if (elapsed_since(now_ms, &o->draw_since_ms) < cfg->min_continuous_draw_ms) {
     /* Still a plausible long heating run. But if the water is ALREADY over
      * target and the heater has not released, that is worth flagging early —
      * a correctly working thermostat would have opened by now. */
-    o->verdict = too_hot ? AQUA_VERDICT_SUSPECT : AQUA_VERDICT_OK;
+    o->verdict = (too_hot && climbing) ? AQUA_VERDICT_SUSPECT : AQUA_VERDICT_OK;
     return o->verdict;
   }
 
   /* Drawing without pause for longer than any healthy run. If the water is
    * also over target, the internal thermostat has stuck closed. */
-  o->verdict = too_hot ? AQUA_VERDICT_FAULT : AQUA_VERDICT_SUSPECT;
+  o->verdict = (too_hot && climbing) ? AQUA_VERDICT_FAULT : AQUA_VERDICT_SUSPECT;
   return o->verdict;
 }
 
@@ -308,6 +400,8 @@ void aqua_pump_init(aqua_pump_t *p) {
   }
   p->no_draw_active = false;
   p->no_draw_since_ms = 0u;
+  p->last_update_ms = 0u;
+  p->has_last = false;
   p->verdict = AQUA_VERDICT_UNKNOWN;
 }
 
@@ -315,6 +409,8 @@ aqua_pump_cfg_t aqua_pump_default_cfg(void) {
   aqua_pump_cfg_t c;
   c.confirm_ms = 60u * 1000u; /* 60 s — rules out a brief brownout */
   c.draw_threshold_dw = 20u;  /* 2.0 W; small nano pumps are only a few watts */
+  /* Confirm window is 60 s. */
+  c.max_gap_ms = 90u * 1000u;
   return c;
 }
 
@@ -323,6 +419,16 @@ aqua_verdict_t aqua_pump_update(aqua_pump_t *p, const aqua_pump_cfg_t *cfg,
                                 uint16_t watts_dw) {
   if (p == NULL || cfg == NULL) {
     return AQUA_VERDICT_UNKNOWN;
+  }
+
+  /* A gap or a backwards clock step means the interval was not observed, so it
+   * cannot count as evidence. Restart the window and report UNKNOWN — under
+   * ADR-014 "I stopped hearing about this" is a state, not an all-clear. */
+  if (!sample_continuous(now_ms, &p->last_update_ms, &p->has_last,
+                         cfg->max_gap_ms)) {
+    p->no_draw_active = false;
+    p->verdict = AQUA_VERDICT_UNKNOWN;
+    return p->verdict;
   }
 
   if (!commanded_on || watts_dw > cfg->draw_threshold_dw) {

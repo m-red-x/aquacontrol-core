@@ -375,6 +375,142 @@ static void test_weld_and_overheat_are_distinct(void) {
   CHECK_EQ(aqua_weld_update(&w, &wc, 0u, true, 3000u), AQUA_VERDICT_OK);
 }
 
+/* ========================= sample continuity ============================== */
+
+/* ⚠️ THE ONE THAT WOULD CUT THE HEATER IN WINTER.
+ *
+ * A detector only sees the samples it is given. Feed it two samples three hours
+ * apart and, without a gap check, it cannot tell that from three hours of
+ * continuously observed evidence.
+ *
+ * That is not hypothetical: the hub sleeps, plugs buffer events, ESP-NOW peers
+ * drop — AQUA-PWR issue #19 exists precisely because of it. And overheat FAULT
+ * OPENS THE HEATER RELAY and latches, so a dropout would cut heat to a healthy
+ * tank until a firmware reset. */
+static void test_radio_dropout_does_not_manufacture_a_fault(void) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  aqua_verdict_t v;
+
+  aqua_overheat_init(&o);
+
+  /* One sample: heater drawing, water a little over target. */
+  v = aqua_overheat_update(&o, &cfg, 0u, true, 250u, 26500, 25000);
+  CHECK_EQ(v, AQUA_VERDICT_OK);
+
+  /* Peer drops. Three hours later a single frame arrives, same conditions.
+   * The heater cycled normally throughout — we simply did not see it. */
+  v = aqua_overheat_update(&o, &cfg, 3u * 60u * MIN_MS, true, 250u, 26500, 25000);
+  CHECK(v != AQUA_VERDICT_FAULT); /* must NOT cut the heater */
+  CHECK_EQ(v, AQUA_VERDICT_UNKNOWN);
+}
+
+/* Same shape on the weld detector, where it is worst: confirm_ms is only 5 s,
+ * so any two distant samples would otherwise latch an unclearable
+ * "unplug it at the wall" alarm. */
+static void test_dropout_does_not_confirm_a_weld(void) {
+  aqua_weld_t w;
+  aqua_weld_cfg_t cfg = aqua_weld_default_cfg();
+
+  aqua_weld_init(&w);
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 0u, false, 3000u), AQUA_VERDICT_SUSPECT);
+
+  /* An hour of silence, then one sample. Not evidence of a sustained weld. */
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 60u * MIN_MS, false, 3000u),
+           AQUA_VERDICT_UNKNOWN);
+}
+
+/* But a fault we DID confirm must survive a dropout. Losing contact is not a
+ * reason to forget something already established. */
+static void test_latched_fault_survives_a_dropout(void) {
+  aqua_weld_t w;
+  aqua_weld_cfg_t cfg = aqua_weld_default_cfg();
+
+  aqua_weld_init(&w);
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 0u, false, 3000u), AQUA_VERDICT_SUSPECT);
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 6000u, false, 3000u), AQUA_VERDICT_FAULT);
+  /* Three hours of silence. The alarm stands. */
+  CHECK_EQ(aqua_weld_update(&w, &cfg, 3u * 60u * MIN_MS, false, 3000u),
+           AQUA_VERDICT_FAULT);
+}
+
+/* ⚠️ DST. Bulgaria puts the clock back an hour at 04:00 on the last Sunday in
+ * October, and the hub has a DS3231 with no NTP. A backwards step must not
+ * report OK about a heater that has been dead for two hours — that is exactly
+ * the false all-clear ADR-014 calls the worst failure this product can have. */
+static void test_backwards_clock_does_not_report_ok(void) {
+  aqua_heater_t h;
+  aqua_heater_cfg_t cfg = aqua_heater_default_cfg();
+  uint64_t t;
+  aqua_verdict_t v = AQUA_VERDICT_UNKNOWN;
+  int32_t temp = 25000;
+
+  aqua_heater_init(&h);
+
+  /* Two hours of a dead heater, water falling. Reaches SUSPECT or FAULT. */
+  for (t = 0; t <= 119u * MIN_MS; t += MIN_MS) {
+    if (t > 0 && (t / MIN_MS) % 30u == 0u) {
+      temp -= 200;
+    }
+    v = aqua_heater_update(&h, &cfg, t, true, 0u, temp);
+  }
+  CHECK(v == AQUA_VERDICT_SUSPECT || v == AQUA_VERDICT_FAULT);
+
+  /* Clock steps back one hour. The heater is still dead. */
+  v = aqua_heater_update(&h, &cfg, 59u * MIN_MS, true, 0u, temp);
+  CHECK(v != AQUA_VERDICT_OK); /* the bug was: this returned OK */
+  CHECK_EQ(v, AQUA_VERDICT_UNKNOWN);
+}
+
+/* A forward clock step — the hub reading its RTC for the first time after boot
+ * — must not instantly satisfy a confirmation window either. */
+static void test_forward_clock_jump_does_not_confirm(void) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  aqua_verdict_t v;
+
+  aqua_overheat_init(&o);
+  v = aqua_overheat_update(&o, &cfg, 0u, true, 250u, 26500, 25000);
+  CHECK_EQ(v, AQUA_VERDICT_OK);
+
+  /* now_ms leaps a day when the RTC is read. */
+  v = aqua_overheat_update(&o, &cfg, 24u * 60u * MIN_MS, true, 250u, 26500, 25000);
+  CHECK(v != AQUA_VERDICT_FAULT);
+}
+
+/* Normal sampling must not be disturbed by any of this. */
+static void test_regular_sampling_is_unaffected(void) {
+  aqua_temp_band_t b;
+  aqua_temp_band_cfg_t cfg = aqua_temp_band_default_cfg();
+  uint64_t t;
+  int worst = AQUA_VERDICT_OK;
+
+  aqua_temp_band_init(&b);
+  for (t = 0; t < 24u * 60u * MIN_MS; t += MIN_MS) {
+    aqua_verdict_t v = aqua_temp_band_update(&b, &cfg, t, 24000);
+    if ((int)v > worst) {
+      worst = (int)v;
+    }
+  }
+  CHECK_EQ(worst, AQUA_VERDICT_OK);
+}
+
+/* A tank sitting steadily over target is at equilibrium, not running away.
+ * The header claims "and still climbing" — this pins that it is real. */
+static void test_overheat_requires_climbing_not_just_hot(void) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  uint64_t t;
+  aqua_verdict_t v = AQUA_VERDICT_UNKNOWN;
+
+  aqua_overheat_init(&o);
+  /* Drawing continuously, 1.5 C over target, but flat — not rising. */
+  for (t = 0; t <= 90u * MIN_MS; t += MIN_MS) {
+    v = aqua_overheat_update(&o, &cfg, t, true, 250u, 26500, 25000);
+  }
+  CHECK_EQ(v, AQUA_VERDICT_SUSPECT); /* flagged, but do not cut the heater */
+}
+
 /* ---------------------------------------------------------------- pump ---- */
 
 static void test_pump_stopped_detected(void) {
@@ -445,6 +581,13 @@ int main(void) {
   test_cycling_heater_never_trips_overheat();
   test_continuous_draw_but_cold_is_not_a_fault();
   test_weld_and_overheat_are_distinct();
+  test_radio_dropout_does_not_manufacture_a_fault();
+  test_dropout_does_not_confirm_a_weld();
+  test_latched_fault_survives_a_dropout();
+  test_backwards_clock_does_not_report_ok();
+  test_forward_clock_jump_does_not_confirm();
+  test_regular_sampling_is_unaffected();
+  test_overheat_requires_climbing_not_just_hot();
   test_pump_stopped_detected();
   test_pump_quiet_when_running();
   test_o2_capacity_matches_reference_table();
