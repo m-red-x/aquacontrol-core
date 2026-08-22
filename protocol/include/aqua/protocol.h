@@ -31,8 +31,60 @@ typedef enum {
   AQUA_FRAME_EVENT = 2,
   AQUA_FRAME_CMD = 3,
   AQUA_FRAME_SCHED = 4,
-  AQUA_FRAME_ACK = 5
+  AQUA_FRAME_ACK = 5,
+  AQUA_FRAME_SENSOR = 6 /* battery sensor node -> hub, transmit-only (ADR-015) */
 } aqua_frame_type_t;
+
+/* =========================================================================
+ * SENSOR NODES
+ *
+ * A sensor node is a small battery device clipped to the tank rim, with its
+ * electronics, cell and antenna ENTIRELY IN AIR, and only the probe in the
+ * water on the lead it already has.
+ *
+ * ⚠️ It is NOT submerged, and it never will be. Fresh water attenuates
+ * 2.45 GHz at ~2.5 dB/cm — but the term that actually kills it is that water's
+ * MICROWAVE refractive index is ~8.8, not the optical 1.33 everyone reasons
+ * from. That gives a 6.5 degree critical angle at the surface, so an isotropic
+ * submerged radiator gets only ~0.33% of its power into the escape cone: a
+ * ~29 dB floor that is DEPTH-INDEPENDENT. "Keep it shallow" does not rescue
+ * it, and neither does more TX power. See ADR-015.
+ *
+ * This frame is defined NOW, while AQUA_PROTO_MAJOR is 0 and nothing is
+ * deployed, because adding it later means reflashing every device by hand
+ * (ADR-013). No node firmware exists and none is planned for v1.
+ * ========================================================================= */
+
+/* What a node measured. THE UNIT IS IMPLIED BY THE KIND, always core/'s native
+ * unit — exactly as power is always deciwatts. No exponent byte, no unit field:
+ * a per-kind implied scale costs nothing on the wire, needs no FPU, and cannot
+ * be got right by one end and wrong by the other. */
+typedef enum {
+  AQUA_SENS_NONE = 0,
+  AQUA_SENS_TEMP_MC = 1, /* millidegrees C — 25.0 C is 25000, per detectors.h */
+  AQUA_SENS_EC_USCM = 2, /* microsiemens/cm, raw. ppm is a hub-side view: the
+                          * conversion factor (0.5 / 0.64 / 0.7) is a display
+                          * convention and the edge must not bake one in. */
+  AQUA_SENS_VBAT_MV = 3  /* the NODE's own cell, millivolts. ADR-014 wants a
+                          * distinct early low-battery warning; without this the
+                          * only failure signal is "went silent" — a full alarm
+                          * arriving days after it could have been a warning.
+                          * A kind, not a field on every frame. */
+} aqua_sense_kind_t;
+
+/* "I woke, took a reading, and have nothing I trust" — deliberately distinct
+ * from sending nothing at all, and it must never render as a value (ADR-014).
+ *
+ * Temperature does not need it: the DS18B20 sentinels (+85000, -127000) ride
+ * the wire unchanged and aqua_probe_check() already classifies them, so probe
+ * health survives a radio hop with no extra protocol surface. */
+#define AQUA_SENSE_NO_READING INT32_MIN
+
+typedef struct {
+  uint8_t dev;   /* same index space as plugs; the frame type disambiguates */
+  uint8_t kind;  /* aqua_sense_kind_t */
+  int32_t value; /* unit implied by kind; AQUA_SENSE_NO_READING if none */
+} aqua_sensor_msg_t;
 
 typedef enum {
   AQUA_EV_NONE = 0,
@@ -100,6 +152,7 @@ int aqua_encode_event(const aqua_event_msg_t *m, uint8_t *out, size_t cap);
 int aqua_encode_cmd(const aqua_cmd_msg_t *m, uint8_t *out, size_t cap);
 int aqua_encode_sched(const aqua_sched_msg_t *m, uint8_t *out, size_t cap);
 int aqua_encode_ack(const aqua_ack_msg_t *m, uint8_t *out, size_t cap);
+int aqua_encode_sensor(const aqua_sensor_msg_t *m, uint8_t *out, size_t cap);
 
 /* --- decode ------------------------------------------------------------- */
 
@@ -108,6 +161,8 @@ aqua_result_t aqua_decode_event(const uint8_t *buf, size_t len, aqua_event_msg_t
 aqua_result_t aqua_decode_cmd(const uint8_t *buf, size_t len, aqua_cmd_msg_t *m);
 aqua_result_t aqua_decode_sched(const uint8_t *buf, size_t len, aqua_sched_msg_t *m);
 aqua_result_t aqua_decode_ack(const uint8_t *buf, size_t len, aqua_ack_msg_t *m);
+aqua_result_t aqua_decode_sensor(const uint8_t *buf, size_t len,
+                                 aqua_sensor_msg_t *m);
 
 #ifdef __cplusplus
 }

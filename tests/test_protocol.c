@@ -1,3 +1,4 @@
+#include "aqua/detectors.h"
 #include "aqua/protocol.h"
 #include "aqua_test.h"
 
@@ -192,6 +193,135 @@ static void test_peek_reports_type_and_length(void) {
   CHECK_EQ(plen, 10);
 }
 
+
+/* ============================== sensor frames ============================= */
+
+static void test_sensor_round_trip(void) {
+  aqua_sensor_msg_t in;
+  aqua_sensor_msg_t out;
+  uint8_t buf[AQUA_FRAME_MAX];
+  int n;
+
+  in.dev = 5u;
+  in.kind = AQUA_SENS_TEMP_MC;
+  in.value = 25400; /* 25.4 C */
+
+  n = aqua_encode_sensor(&in, buf, sizeof(buf));
+  CHECK_EQ(n, 9);
+  CHECK_EQ(aqua_decode_sensor(buf, (size_t)n, &out), AQUA_OK);
+  CHECK_EQ(out.dev, in.dev);
+  CHECK_EQ(out.kind, in.kind);
+  CHECK_EQ(out.value, in.value);
+}
+
+/* The whole point of carrying temperature in core/'s native millidegrees: the
+ * DS18B20 fault sentinels must survive a radio hop BYTE-IDENTICALLY so that
+ * aqua_probe_check() still classifies them on the far side. If the signed
+ * encoding were wrong, a disconnected probe would arrive as a plausible
+ * temperature - which is exactly the false all-clear ADR-014 forbids. */
+static void test_negative_and_sentinel_values_survive(void) {
+  aqua_sensor_msg_t in;
+  aqua_sensor_msg_t out;
+  uint8_t buf[AQUA_FRAME_MAX];
+  int n;
+  size_t i;
+
+  const int32_t cases[] = {0,     1,         -1,        25000,
+                           85000, -127000,   INT32_MAX, INT32_MIN};
+
+  for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    in.dev = 0u;
+    in.kind = AQUA_SENS_TEMP_MC;
+    in.value = cases[i];
+    n = aqua_encode_sensor(&in, buf, sizeof(buf));
+    CHECK_EQ(n, 9);
+    CHECK_EQ(aqua_decode_sensor(buf, (size_t)n, &out), AQUA_OK);
+    CHECK_EQ(out.value, cases[i]);
+  }
+
+  /* And after the round trip they must still read as FAULTS, not temperatures. */
+  in.value = 85000;
+  n = aqua_encode_sensor(&in, buf, sizeof(buf));
+  CHECK_EQ(aqua_decode_sensor(buf, (size_t)n, &out), AQUA_OK);
+  CHECK_EQ(aqua_probe_check(out.value), AQUA_PROBE_POWER_ON_DEFAULT);
+
+  in.value = -127000;
+  n = aqua_encode_sensor(&in, buf, sizeof(buf));
+  CHECK_EQ(aqua_decode_sensor(buf, (size_t)n, &out), AQUA_OK);
+  CHECK_EQ(aqua_probe_check(out.value), AQUA_PROBE_DISCONNECTED);
+}
+
+/* Golden bytes, pinned the same way STATE is. */
+static void test_sensor_wire_bytes_are_stable(void) {
+  aqua_sensor_msg_t in;
+  uint8_t buf[AQUA_FRAME_MAX];
+  int n;
+
+  in.dev = 5u;
+  in.kind = AQUA_SENS_EC_USCM;
+  in.value = 412; /* 0x0000019C, little-endian on the wire */
+
+  n = aqua_encode_sensor(&in, buf, sizeof(buf));
+  CHECK_EQ(n, 9);
+  CHECK_EQ(buf[0], AQUA_PROTO_MAJOR);
+  CHECK_EQ(buf[1], AQUA_FRAME_SENSOR);
+  CHECK_EQ(buf[2], 6); /* payload length */
+  CHECK_EQ(buf[3], 5); /* dev */
+  CHECK_EQ(buf[4], 2); /* AQUA_SENS_EC_USCM */
+  CHECK_EQ(buf[5], 0x9C);
+  CHECK_EQ(buf[6], 0x01);
+  CHECK_EQ(buf[7], 0x00);
+  CHECK_EQ(buf[8], 0x00);
+}
+
+/* An unknown kind from a newer node must DECODE, not be rejected - the hub
+ * drops it in its dispatcher rather than discarding the whole frame. */
+static void test_unknown_sense_kind_is_passed_through(void) {
+  uint8_t buf[AQUA_FRAME_MAX];
+  aqua_sensor_msg_t in;
+  aqua_sensor_msg_t out;
+  int n;
+
+  in.dev = 1u;
+  in.kind = 99u; /* a kind this build has never heard of */
+  in.value = 7;
+  n = aqua_encode_sensor(&in, buf, sizeof(buf));
+  CHECK_EQ(aqua_decode_sensor(buf, (size_t)n, &out), AQUA_OK);
+  CHECK_EQ(out.kind, 99);
+}
+
+/* Same hostile-input discipline as every other decoder. */
+static void test_sensor_rejects_bad_input(void) {
+  aqua_sensor_msg_t in;
+  aqua_sensor_msg_t out;
+  uint8_t buf[AQUA_FRAME_MAX];
+  uint8_t small[4];
+  int n;
+  size_t i;
+
+  in.dev = 1u;
+  in.kind = AQUA_SENS_TEMP_MC;
+  in.value = 25000;
+  n = aqua_encode_sensor(&in, buf, sizeof(buf));
+
+  for (i = 0; i < (size_t)n; i++) {
+    CHECK_EQ(aqua_decode_sensor(buf, i, &out), AQUA_ERR_TRUNCATED);
+  }
+  CHECK_EQ(aqua_decode_sensor(buf, (size_t)n, NULL), AQUA_ERR_RANGE);
+
+  /* A SENSOR frame must not decode as a STATE frame. */
+  {
+    aqua_state_msg_t st;
+    CHECK_EQ(aqua_decode_state(buf, (size_t)n, &st), AQUA_ERR_BAD_TYPE);
+  }
+
+  in.dev = 99u; /* beyond AQUA_MAX_DEVICES */
+  CHECK_EQ(aqua_encode_sensor(&in, buf, sizeof(buf)), AQUA_ERR_RANGE);
+
+  in.dev = 1u;
+  CHECK_EQ(aqua_encode_sensor(&in, small, sizeof(small)), AQUA_ERR_NOSPACE);
+}
+
 int main(void) {
   test_state_round_trip();
   test_state_wire_bytes_are_stable();
@@ -203,5 +333,10 @@ int main(void) {
   test_out_of_range_is_rejected();
   test_encode_respects_buffer_capacity();
   test_peek_reports_type_and_length();
+  test_sensor_round_trip();
+  test_negative_and_sentinel_values_survive();
+  test_sensor_wire_bytes_are_stable();
+  test_unknown_sense_kind_is_passed_through();
+  test_sensor_rejects_bad_input();
   AQUA_TEST_REPORT();
 }

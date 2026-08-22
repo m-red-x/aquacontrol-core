@@ -15,6 +15,22 @@ static void put_u32(uint8_t *p, uint32_t v) {
   p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
+static void put_i32(uint8_t *p, int32_t v) { put_u32(p, (uint32_t)v); }
+
+/* uint32 -> int32 conversion is implementation-defined above INT32_MAX, so
+ * reconstruct the value explicitly rather than casting. This file is
+ * deliberately pedantic about not depending on compiler behaviour, and the
+ * idiom optimises to nothing on every real compiler.
+ * Checked against 0xFFFFFFFF (-1), 0x80000000 (INT32_MIN), 0xFFFE0FE8
+ * (-127000, the DS18B20 bus-error sentinel) and 0x00014C08 (85000). */
+static int32_t get_i32(const uint8_t *p) {
+  uint32_t u = get_u32(p);
+  if (u <= (uint32_t)INT32_MAX) {
+    return (int32_t)u;
+  }
+  return -(int32_t)(0xFFFFFFFFu - u) - 1;
+}
+
 static uint16_t get_u16(const uint8_t *p) {
   return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
@@ -172,6 +188,25 @@ int aqua_encode_ack(const aqua_ack_msg_t *m, uint8_t *out, size_t cap) {
   return (int)(AQUA_FRAME_HEADER_LEN + plen);
 }
 
+int aqua_encode_sensor(const aqua_sensor_msg_t *m, uint8_t *out, size_t cap) {
+  const uint8_t plen = 6u;
+  int h;
+  if (m == NULL || out == NULL) {
+    return AQUA_ERR_RANGE;
+  }
+  if (m->dev >= AQUA_MAX_DEVICES) {
+    return AQUA_ERR_RANGE;
+  }
+  h = write_header(out, cap, AQUA_FRAME_SENSOR, plen);
+  if (h < 0) {
+    return h;
+  }
+  out[3] = m->dev;
+  out[4] = m->kind;
+  put_i32(&out[5], m->value);
+  return (int)(AQUA_FRAME_HEADER_LEN + plen);
+}
+
 /* --- decode ------------------------------------------------------------- */
 
 aqua_result_t aqua_decode_state(const uint8_t *buf, size_t len,
@@ -268,5 +303,28 @@ aqua_result_t aqua_decode_ack(const uint8_t *buf, size_t len, aqua_ack_msg_t *m)
     return r;
   }
   m->seq = get_u32(&p[0]);
+  return AQUA_OK;
+}
+
+aqua_result_t aqua_decode_sensor(const uint8_t *buf, size_t len,
+                                 aqua_sensor_msg_t *m) {
+  const uint8_t *p;
+  aqua_result_t r;
+  if (m == NULL) {
+    return AQUA_ERR_RANGE;
+  }
+  r = take_payload(buf, len, AQUA_FRAME_SENSOR, 6u, &p);
+  if (r != AQUA_OK) {
+    return r;
+  }
+  if (p[0] >= AQUA_MAX_DEVICES) {
+    return AQUA_ERR_RANGE;
+  }
+  m->dev = p[0];
+  /* kind is NOT validated against the enum, deliberately: a newer node may
+   * report a measurement this build does not know about, and dropping it in the
+   * hub's dispatcher is better than rejecting the whole frame. */
+  m->kind = p[1];
+  m->value = get_i32(&p[2]);
   return AQUA_OK;
 }
