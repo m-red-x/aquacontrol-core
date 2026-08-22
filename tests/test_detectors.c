@@ -219,9 +219,16 @@ static void test_weld_and_overheat_are_distinct(void) {
   aqua_weld_init(&w);
   aqua_overheat_init(&o);
 
-  /* Commanded OFF, current flowing = welded plug relay. The overheat detector
-   * must stay quiet: this is not the tank-cooking failure. */
+  /* Commanded OFF, current flowing = welded plug relay. Needs two samples:
+   * one to start the confirm window, one past it. */
+  CHECK_EQ(aqua_weld_update(&w, &wc, 0u, false, 3000u), AQUA_VERDICT_SUSPECT);
   CHECK_EQ(aqua_weld_update(&w, &wc, 6000u, false, 3000u), AQUA_VERDICT_FAULT);
+
+  /* Same input, overheat detector: must stay quiet. A welded plug relay is
+   * not the tank-cooking failure, and treating it as one would be the very
+   * conflation this test exists to prevent. */
+  CHECK_EQ(aqua_overheat_update(&o, &oc, 0u, false, 3000u, 25000, 25000),
+           AQUA_VERDICT_OK);
   CHECK_EQ(aqua_overheat_update(&o, &oc, 6000u, false, 3000u, 25000, 25000),
            AQUA_VERDICT_OK);
 
