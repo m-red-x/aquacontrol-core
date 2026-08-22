@@ -15,6 +15,15 @@ static void put_u32(uint8_t *p, uint32_t v) {
   p[3] = (uint8_t)((v >> 24) & 0xFFu);
 }
 
+static uint16_t get_u16(const uint8_t *p) {
+  return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint32_t get_u32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
+}
+
 static void put_i32(uint8_t *p, int32_t v) { put_u32(p, (uint32_t)v); }
 
 /* uint32 -> int32 conversion is implementation-defined above INT32_MAX, so
@@ -29,15 +38,6 @@ static int32_t get_i32(const uint8_t *p) {
     return (int32_t)u;
   }
   return -(int32_t)(0xFFFFFFFFu - u) - 1;
-}
-
-static uint16_t get_u16(const uint8_t *p) {
-  return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
-static uint32_t get_u32(const uint8_t *p) {
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-         ((uint32_t)p[3] << 24);
 }
 
 static int write_header(uint8_t *out, size_t cap, aqua_frame_type_t type,
