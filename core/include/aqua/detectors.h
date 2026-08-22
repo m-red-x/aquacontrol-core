@@ -152,7 +152,7 @@ aqua_verdict_t aqua_heater_update(aqua_heater_t *h, const aqua_heater_cfg_t *cfg
                                   uint16_t watts_dw, int32_t water_temp_mc);
 
 /* =========================================================================
- * RELAY WELD  —  the genuinely novel claim in this product (ADR-004)
+ * RELAY WELD  (ADR-004)
  *
  * Commanded OFF, but current is still flowing: the relay contacts have welded
  * shut. On a heater outlet this means a tank that CANNOT BE TURNED OFF, which
