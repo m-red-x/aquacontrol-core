@@ -1,6 +1,7 @@
 #include "aqua/detectors.h"
 #include "aqua_test.h"
 #include <stddef.h>
+#include <stdint.h> /* INT32_MAX / INT32_MIN, for the corrupt-setpoint tests */
 
 #define MIN_MS (60u * 1000u)
 
@@ -313,6 +314,88 @@ static void test_stuck_thermostat_is_detected(void) {
   CHECK_EQ(v, AQUA_VERDICT_FAULT);
 }
 
+/* ------------------------------------------------- corrupt setpoint guard --
+ *
+ * aqua_overheat_update() is the ONLY detector whose FAULT opens the heater
+ * relay, and it takes two temperatures: the probe reading and the stored
+ * setpoint. The probe has been guarded since the beginning. The setpoint was
+ * not, and when a guard was finally added it reused the PROBE band — whose
+ * lower bound is 0 — so a zeroed NVS record sailed through it.
+ *
+ * These drive the exact conditions that produce a genuine FAULT (continuous
+ * draw for well over the confirm window, water above target, climbing) and
+ * assert that a bad setpoint still never reaches FAULT. Getting this wrong
+ * does not fail safe: it cuts the heater on a healthy tank, in winter. */
+
+/* Runs the stuck-thermostat scenario — continuous draw, water climbing 0.1 C
+ * every 5 min for 90 min — and returns the WORST verdict seen.
+ *
+ * start_temp is separate from target on purpose. The bad-setpoint tests hold
+ * the water at a realistic 25 C so the reading stays inside the probe band:
+ * otherwise a target of -1 would also produce an invalid PROBE reading and the
+ * test would pass for the wrong reason. The plausible-setpoint sweep starts the
+ * water AT the target so it genuinely climbs past it at every setting. */
+static aqua_verdict_t worst_overheat_run(int32_t start_temp, int32_t target) {
+  aqua_overheat_t o;
+  aqua_overheat_cfg_t cfg = aqua_overheat_default_cfg();
+  uint64_t t;
+  int32_t temp = start_temp;
+  int worst = AQUA_VERDICT_UNKNOWN;
+
+  aqua_overheat_init(&o);
+  for (t = 0; t <= 90u * MIN_MS; t += MIN_MS) {
+    aqua_verdict_t v;
+    if (t > 0 && (t / MIN_MS) % 5u == 0u) {
+      temp += 100;
+    }
+    v = aqua_overheat_update(&o, &cfg, t, true, 250u, temp, target);
+    if ((int)v > worst) {
+      worst = (int)v;
+    }
+  }
+  return (aqua_verdict_t)worst;
+}
+
+/* Water held at a healthy, valid 25 C. Only the setpoint is bad. */
+static aqua_verdict_t worst_overheat_for_setpoint(int32_t target) {
+  return worst_overheat_run(25000, target);
+}
+
+/* An erased flash page reads 0xFFFFFFFF, which arrives here as -1. */
+static void test_overheat_rejects_an_erased_flash_setpoint(void) {
+  CHECK_EQ(worst_overheat_for_setpoint(-1), AQUA_VERDICT_SUSPECT);
+}
+
+/* A zeroed or partially written NVS record arrives as 0. THIS is the one the
+ * probe-band guard missed: 0 is a legitimate probe reading, so it passed, and
+ * every normal tank is then "far above target" forever. */
+static void test_overheat_rejects_a_zeroed_setpoint(void) {
+  CHECK_EQ(worst_overheat_for_setpoint(0), AQUA_VERDICT_SUSPECT);
+}
+
+/* Garbage large enough to overflow an unguarded target + over_target_mc. */
+static void test_overheat_rejects_an_absurd_setpoint(void) {
+  CHECK_EQ(worst_overheat_for_setpoint(INT32_MAX), AQUA_VERDICT_SUSPECT);
+  CHECK_EQ(worst_overheat_for_setpoint(INT32_MIN), AQUA_VERDICT_SUSPECT);
+  /* 45 C is a valid PROBE reading (heatwave) but never a heater setting. */
+  CHECK_EQ(worst_overheat_for_setpoint(45000), AQUA_VERDICT_SUSPECT);
+}
+
+/* The mirror image, and the reason the band is not tighter: a rejected setpoint
+ * DISABLES overheat protection. If someone narrows this band to "22-26 because
+ * that is the target range in the docs", a discus keeper at 30 C silently loses
+ * the only detector that can save the tank. Every plausible aquarium heater
+ * setting must still reach FAULT. */
+static void test_overheat_accepts_every_plausible_setpoint(void) {
+  int32_t target;
+  for (target = AQUA_SETPOINT_MIN_MC; target <= AQUA_SETPOINT_MAX_MC;
+       target += 500) {
+    /* Water starts at target and climbs past it, so the scenario is a genuine
+     * stuck thermostat at every setting rather than only at 25 C. */
+    CHECK_EQ(worst_overheat_run(target, target), AQUA_VERDICT_FAULT);
+  }
+}
+
 /* A healthy heater cycles. Any break in the draw clears the timer, so normal
  * operation must never trip this — including on a cold morning when the heater
  * works unusually hard. */
@@ -553,6 +636,62 @@ static void test_pump_quiet_when_running(void) {
   }
 }
 
+/* The threshold is the boundary between "this pump is monitorable" and "this
+ * pump is invisible to the meter", so pin which side of it counts as running.
+ * The comparison is strictly greater: a pump sitting EXACTLY on the threshold
+ * is treated as not drawing. That is the deliberately cautious reading — the
+ * ~2 W meter floor is itself uncertain — but it must not flip silently, because
+ * flipping it either alarms on healthy pumps or blinds the detector. */
+static void test_pump_threshold_boundary_is_pinned(void) {
+  aqua_pump_t p;
+  aqua_pump_cfg_t cfg = aqua_pump_default_cfg();
+
+  CHECK_EQ(cfg.draw_threshold_dw, 50u); /* 5.0 W — see ADR-004 and the meter floor */
+
+  /* Exactly at the threshold counts as NOT drawing. */
+  aqua_pump_init(&p);
+  CHECK_EQ(aqua_pump_update(&p, &cfg, 0u, true, 50u), AQUA_VERDICT_SUSPECT);
+
+  /* One deciwatt above it counts as running. */
+  aqua_pump_init(&p);
+  CHECK_EQ(aqua_pump_update(&p, &cfg, 0u, true, 51u), AQUA_VERDICT_OK);
+}
+
+/* The pump detector had no radio-dropout test, though the heater and weld
+ * detectors both do. A silent peer must never become a confirmed fault: the
+ * gap means the interval was not observed, so it cannot be evidence (ADR-014).
+ * Without this, losing the plug for two minutes reports the pump as stopped. */
+static void test_pump_dropout_does_not_manufacture_a_fault(void) {
+  aqua_pump_t p;
+  aqua_pump_cfg_t cfg = aqua_pump_default_cfg();
+
+  aqua_pump_init(&p);
+  CHECK_EQ(aqua_pump_update(&p, &cfg, 0u, true, 0u), AQUA_VERDICT_SUSPECT);
+
+  /* Radio silence for well past both the gap tolerance and the confirm window.
+   * Elapsed wall-clock alone must not confirm anything. */
+  CHECK_EQ(aqua_pump_update(&p, &cfg, 10u * MIN_MS, true, 0u),
+           AQUA_VERDICT_UNKNOWN);
+
+  /* And the window restarts rather than resuming — one more sample right after
+   * the dropout is not 60 s of continuous evidence. */
+  CHECK_EQ(aqua_pump_update(&p, &cfg, 10u * MIN_MS + 1000u, true, 0u),
+           AQUA_VERDICT_SUSPECT);
+}
+
+/* A backwards clock step (DST, or an NTP correction on the hub) must not be
+ * read as elapsed time either. */
+static void test_pump_backwards_clock_does_not_confirm(void) {
+  aqua_pump_t p;
+  aqua_pump_cfg_t cfg = aqua_pump_default_cfg();
+
+  aqua_pump_init(&p);
+  CHECK_EQ(aqua_pump_update(&p, &cfg, 60u * MIN_MS, true, 0u),
+           AQUA_VERDICT_SUSPECT);
+  CHECK_EQ(aqua_pump_update(&p, &cfg, 30u * MIN_MS, true, 0u),
+           AQUA_VERDICT_UNKNOWN);
+}
+
 /* ----------------------------------------------------------- O2 ceiling --- */
 
 /* Reference values from Benson-Krause, the equation APHA Standard Methods and
@@ -593,6 +732,10 @@ int main(void) {
   test_weld_quiet_when_relay_commanded_on();
   test_weld_ignores_switching_transient();
   test_stuck_thermostat_is_detected();
+  test_overheat_rejects_an_erased_flash_setpoint();
+  test_overheat_rejects_a_zeroed_setpoint();
+  test_overheat_rejects_an_absurd_setpoint();
+  test_overheat_accepts_every_plausible_setpoint();
   test_cycling_heater_never_trips_overheat();
   test_continuous_draw_but_cold_is_not_a_fault();
   test_weld_and_overheat_are_distinct();
@@ -605,6 +748,9 @@ int main(void) {
   test_overheat_requires_climbing_not_just_hot();
   test_pump_stopped_detected();
   test_pump_quiet_when_running();
+  test_pump_threshold_boundary_is_pinned();
+  test_pump_dropout_does_not_manufacture_a_fault();
+  test_pump_backwards_clock_does_not_confirm();
   test_o2_capacity_matches_reference_table();
   test_o2_interpolates_and_clamps();
   AQUA_TEST_REPORT();

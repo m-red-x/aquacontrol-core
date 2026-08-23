@@ -350,13 +350,20 @@ aqua_verdict_t aqua_overheat_update(aqua_overheat_t *o,
     return o->verdict;
   }
 
-  /* The SETPOINT is the only other temperature feeding this decision, and it
-   * was unguarded. A corrupt or never-written NVS value reading back as
-   * 0xFFFFFFFF gives target = -1, making too_hot true at any normal tank
-   * temperature - and FAULT here OPENS THE HEATER RELAY. The header's warning
-   * about believing a bad probe applies word for word to believing a bad
-   * setpoint. Also stops an unguarded int32 addition from overflowing. */
-  if (target_temp_mc < AQUA_PROBE_MIN_MC || target_temp_mc > AQUA_PROBE_MAX_MC) {
+  /* The SETPOINT is the only other temperature feeding this decision, and a
+   * corrupt one makes too_hot true at any normal tank temperature — and FAULT
+   * here OPENS THE HEATER RELAY. The header's warning about believing a bad
+   * probe applies word for word to believing a bad setpoint. Also stops an
+   * unguarded int32 addition from overflowing.
+   *
+   * ⚠️ Guarded against the SETPOINT band, not the PROBE band. The first version
+   * of this guard reused AQUA_PROBE_MIN_MC, which is 0 — so it caught an erased
+   * flash page (0xFFFFFFFF -> -1) but let a zeroed record (0) straight through,
+   * and target = 0 cuts the heater on a perfectly healthy 25 C tank. Both
+   * corruption patterns are equally common. See the band's rationale in
+   * detectors.h. */
+  if (target_temp_mc < AQUA_SETPOINT_MIN_MC ||
+      target_temp_mc > AQUA_SETPOINT_MAX_MC) {
     o->continuous_draw = false;
     o->verdict = AQUA_VERDICT_SUSPECT;
     return o->verdict;

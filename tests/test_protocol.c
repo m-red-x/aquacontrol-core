@@ -165,6 +165,68 @@ static void test_out_of_range_is_rejected(void) {
   CHECK_EQ(aqua_encode_sched(&sched, buf, sizeof(buf)), AQUA_ERR_RANGE);
 }
 
+/* dev = 99 is rejected, but 99 is nowhere near the boundary. The value that
+ * actually decides how many outlets fit is AQUA_MAX_DEVICES itself, and an
+ * off-by-one there is invisible until the day someone adds the 16th device —
+ * or plugs in a 4-outlet strip that registers as four dev ids from one MAC.
+ * Pin both sides of the fence, and pin the fence.
+ *
+ * Valid ids are 0 .. AQUA_MAX_DEVICES-1. */
+static void test_device_id_boundary_is_exact(void) {
+  aqua_state_msg_t in;
+  aqua_sched_msg_t sched;
+  uint8_t buf[AQUA_FRAME_MAX];
+
+  /* The cap must be big enough for the product we described: up to 10 metered
+   * outlets plus sensor nodes. If someone shrinks it, this says so. */
+  CHECK(AQUA_MAX_DEVICES >= 10u);
+
+  in.relay_on = true;
+  in.watts_dw = 100u;
+
+  /* Highest valid id encodes. */
+  in.dev = (uint8_t)(AQUA_MAX_DEVICES - 1u);
+  CHECK(aqua_encode_state(&in, buf, sizeof(buf)) > 0);
+
+  /* One past the end does not. This is the off-by-one. */
+  in.dev = (uint8_t)AQUA_MAX_DEVICES;
+  CHECK_EQ(aqua_encode_state(&in, buf, sizeof(buf)), AQUA_ERR_RANGE);
+
+  /* Same fence on the schedule frame, which has its own range check. */
+  sched.on_minute = 480u;
+  sched.off_minute = 1080u;
+  sched.enabled = true;
+
+  sched.dev = (uint8_t)(AQUA_MAX_DEVICES - 1u);
+  CHECK(aqua_encode_sched(&sched, buf, sizeof(buf)) > 0);
+
+  sched.dev = (uint8_t)AQUA_MAX_DEVICES;
+  CHECK_EQ(aqua_encode_sched(&sched, buf, sizeof(buf)), AQUA_ERR_RANGE);
+}
+
+/* Every device id in range must survive a round trip. A codec that silently
+ * truncated the id field would still pass the single-device tests above. */
+static void test_every_device_id_round_trips(void) {
+  uint8_t dev;
+  for (dev = 0u; dev < (uint8_t)AQUA_MAX_DEVICES; dev++) {
+    aqua_state_msg_t in;
+    aqua_state_msg_t out;
+    uint8_t buf[AQUA_FRAME_MAX];
+    int n;
+
+    in.dev = dev;
+    in.relay_on = ((dev % 2u) == 0u);
+    in.watts_dw = (uint16_t)(dev * 37u);
+
+    n = aqua_encode_state(&in, buf, sizeof(buf));
+    CHECK(n > 0);
+    CHECK_EQ(aqua_decode_state(buf, (size_t)n, &out), AQUA_OK);
+    CHECK_EQ(out.dev, dev);
+    CHECK_EQ(out.relay_on, in.relay_on);
+    CHECK_EQ(out.watts_dw, in.watts_dw);
+  }
+}
+
 static void test_encode_respects_buffer_capacity(void) {
   aqua_state_msg_t in;
   uint8_t small[4];
@@ -331,6 +393,8 @@ int main(void) {
   test_truncated_input_is_rejected();
   test_version_and_type_mismatch_rejected();
   test_out_of_range_is_rejected();
+  test_device_id_boundary_is_exact();
+  test_every_device_id_round_trips();
   test_encode_respects_buffer_capacity();
   test_peek_reports_type_and_length();
   test_sensor_round_trip();

@@ -89,6 +89,30 @@ typedef enum {
 
 aqua_probe_status_t aqua_probe_check(int32_t raw_mc);
 
+/* Plausibility band for a heater SETPOINT. This is a different question from
+ * the probe band above and must not reuse it.
+ *
+ * A probe legitimately reads 0 C — a tank in a winter power cut. A stored
+ * setpoint of 0 C is never legitimate; nobody sets an aquarium heater to
+ * freezing. That difference matters because the setpoint feeds
+ * aqua_overheat_update(), whose FAULT OPENS THE HEATER RELAY.
+ *
+ * The two realistic NVS corruption patterns are an erased flash page, which
+ * reads 0xFFFFFFFF and arrives here as -1, and a zeroed or partially written
+ * record, which arrives as 0. Guarding with AQUA_PROBE_MIN_MC catches the
+ * first and MISSES THE SECOND: with target = 0, any normal tank sits more than
+ * over_target_mc above target, so "too hot" is permanently true and a healthy
+ * 25 C tank gets its heater cut.
+ *
+ * 10-35 C covers every real aquarium heater setting with margin — tropical
+ * community tanks sit at 22-26 C, discus up to 30 C, temperate species lower —
+ * while rejecting 0, -1, 45000 and INT32_MAX. Deliberately not tighter: a
+ * rejected setpoint disables overheat protection entirely, so over-strictness
+ * trades one silent failure for another. Rejection reports SUSPECT rather than
+ * failing quietly, per ADR-014. */
+#define AQUA_SETPOINT_MIN_MC 10000
+#define AQUA_SETPOINT_MAX_MC 35000
+
 /* =========================================================================
  * TEMPERATURE BAND  —  the detector that watches the TANK, not the equipment
  *
